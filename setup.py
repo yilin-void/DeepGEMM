@@ -43,7 +43,7 @@ build_include_dirs = [
     os.path.join(current_dir, 'third-party/cutlass/include'),
     os.path.join(current_dir, 'third-party/fmt/include'),
 ]
-build_libraries = ['cudart', 'nvrtc']
+build_libraries = ['cudart', 'nvrtc', 'nccl']
 build_library_dirs = [f'{CUDA_HOME}/lib64']
 third_party_include_dirs = [
     'third-party/cutlass/include/cute',

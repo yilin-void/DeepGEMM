@@ -69,6 +69,10 @@ try:
         # Hyperconnection kernels
         tf32_hc_prenorm_gemm,
         # Single-node symmetric-memory all-gather helpers
+        nccl_get_unique_id,
+        nccl_comm_init_rank,
+        nccl_allgather_bytes,
+        nccl_allgather_bytes_bench,
         stream_write_value64,
         stream_write_value64_ptr,
         stream_wait_value64_ptr,

@@ -2,15 +2,138 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <algorithm>
 #include <cstring>
+#include <nccl.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <sstream>
 #include <torch/python.h>
 
 #include "../jit/handle.hpp"
 #include "../utils/exception.hpp"
 
 namespace deep_gemm::comm {
+
+#ifndef DG_NCCL_CHECK
+#define DG_NCCL_CHECK(cmd) \
+do { \
+    const auto e = (cmd); \
+    if (e != ncclSuccess) { \
+        std::stringstream ss; \
+        ss << static_cast<int>(e) << " (" << ncclGetErrorString(e) << ")"; \
+        throw DGException("NCCL", __FILE__, __LINE__, ss.str()); \
+    } \
+} while (0)
+#endif
+
+constexpr const char* kNcclCommCapsuleName = "deep_gemm.nccl_comm";
+
+static ncclComm_t get_nccl_comm_from_capsule(const pybind11::capsule& comm_capsule) {
+    auto* ptr = comm_capsule.get_pointer();
+    DG_HOST_ASSERT(ptr != nullptr);
+    return reinterpret_cast<ncclComm_t>(ptr);
+}
+
+static pybind11::bytes nccl_get_unique_id() {
+    ncclUniqueId id;
+    DG_NCCL_CHECK(ncclGetUniqueId(&id));
+    return pybind11::bytes(reinterpret_cast<const char*>(&id), sizeof(id));
+}
+
+static pybind11::capsule nccl_comm_init_rank(const pybind11::bytes& unique_id_bytes,
+                                             const int& rank,
+                                             const int& num_ranks,
+                                             const int& device_idx = -1) {
+    DG_HOST_ASSERT(num_ranks > 0);
+    DG_HOST_ASSERT(rank >= 0 and rank < num_ranks);
+
+    const std::string bytes = unique_id_bytes;
+    DG_HOST_ASSERT(bytes.size() == sizeof(ncclUniqueId));
+    ncclUniqueId id;
+    std::memcpy(&id, bytes.data(), sizeof(id));
+
+    const auto device = device_idx >= 0 ? device_idx : at::cuda::current_device();
+    const c10::cuda::CUDAGuard guard(device);
+    ncclComm_t comm = nullptr;
+    DG_NCCL_CHECK(ncclCommInitRank(&comm, num_ranks, id, rank));
+    return pybind11::capsule(reinterpret_cast<void*>(comm), kNcclCommCapsuleName, [](PyObject* capsule) {
+        auto* ptr = PyCapsule_GetPointer(capsule, kNcclCommCapsuleName);
+        if (ptr != nullptr) {
+            (void)ncclCommDestroy(reinterpret_cast<ncclComm_t>(ptr));
+        }
+    });
+}
+
+static void nccl_allgather_bytes(const torch::Tensor& input,
+                                 const torch::Tensor& output,
+                                 const pybind11::capsule& comm_capsule) {
+    DG_HOST_ASSERT(input.is_cuda() and output.is_cuda());
+    DG_HOST_ASSERT(input.is_contiguous() and output.is_contiguous());
+    DG_HOST_ASSERT(input.device() == output.device());
+    DG_HOST_ASSERT(input.nbytes() > 0);
+
+    auto comm = get_nccl_comm_from_capsule(comm_capsule);
+    int num_ranks = 0;
+    DG_NCCL_CHECK(ncclCommCount(comm, &num_ranks));
+    DG_HOST_ASSERT(num_ranks > 0);
+    DG_HOST_ASSERT(output.nbytes() == input.nbytes() * static_cast<size_t>(num_ranks));
+
+    const c10::cuda::CUDAGuard guard(input.device());
+    const auto stream = static_cast<cudaStream_t>(at::cuda::getCurrentCUDAStream(input.device().index()));
+    DG_NCCL_CHECK(ncclAllGather(input.data_ptr(), output.data_ptr(),
+                                static_cast<size_t>(input.nbytes()), ncclInt8, comm, stream));
+}
+
+static double nccl_allgather_bytes_bench(const torch::Tensor& input,
+                                         const torch::Tensor& output,
+                                         const pybind11::capsule& comm_capsule,
+                                         const int& warmups,
+                                         const int& iters) {
+    DG_HOST_ASSERT(input.is_cuda() and output.is_cuda());
+    DG_HOST_ASSERT(input.is_contiguous() and output.is_contiguous());
+    DG_HOST_ASSERT(input.device() == output.device());
+    DG_HOST_ASSERT(input.nbytes() > 0);
+    DG_HOST_ASSERT(warmups >= 0 and iters > 0);
+
+    auto comm = get_nccl_comm_from_capsule(comm_capsule);
+    int num_ranks = 0;
+    DG_NCCL_CHECK(ncclCommCount(comm, &num_ranks));
+    DG_HOST_ASSERT(num_ranks > 0);
+    DG_HOST_ASSERT(output.nbytes() == input.nbytes() * static_cast<size_t>(num_ranks));
+
+    const c10::cuda::CUDAGuard guard(input.device());
+    const auto stream = static_cast<cudaStream_t>(at::cuda::getCurrentCUDAStream(input.device().index()));
+    for (int i = 0; i < warmups; ++i) {
+        DG_NCCL_CHECK(ncclAllGather(input.data_ptr(), output.data_ptr(),
+                                    static_cast<size_t>(input.nbytes()), ncclInt8, comm, stream));
+    }
+    DG_CUDA_RUNTIME_CHECK(cudaStreamSynchronize(stream));
+
+    cudaEvent_t start = nullptr;
+    cudaEvent_t end = nullptr;
+    DG_CUDA_RUNTIME_CHECK(cudaEventCreate(&start));
+    DG_CUDA_RUNTIME_CHECK(cudaEventCreate(&end));
+
+    std::vector<float> times;
+    times.reserve(static_cast<size_t>(iters));
+    for (int i = 0; i < iters; ++i) {
+        DG_CUDA_RUNTIME_CHECK(cudaEventRecord(start, stream));
+        DG_NCCL_CHECK(ncclAllGather(input.data_ptr(), output.data_ptr(),
+                                    static_cast<size_t>(input.nbytes()), ncclInt8, comm, stream));
+        DG_CUDA_RUNTIME_CHECK(cudaEventRecord(end, stream));
+        DG_CUDA_RUNTIME_CHECK(cudaEventSynchronize(end));
+        float elapsed_ms = 0.0f;
+        DG_CUDA_RUNTIME_CHECK(cudaEventElapsedTime(&elapsed_ms, start, end));
+        times.push_back(elapsed_ms);
+    }
+
+    DG_CUDA_RUNTIME_CHECK(cudaEventDestroy(start));
+    DG_CUDA_RUNTIME_CHECK(cudaEventDestroy(end));
+
+    std::nth_element(times.begin(), times.begin() + times.size() / 2, times.end());
+    return static_cast<double>(times[times.size() / 2]);
+}
 
 static void check_payloads(const std::vector<torch::Tensor>& inputs,
                            const std::vector<torch::Tensor>& outputs,
@@ -248,6 +371,15 @@ static void single_node_allgather(const std::vector<torch::Tensor>& inputs,
 }
 
 static void register_apis(pybind11::module_& m) {
+    m.def("nccl_get_unique_id", &nccl_get_unique_id);
+    m.def("nccl_comm_init_rank", &nccl_comm_init_rank,
+          pybind11::arg("unique_id"), pybind11::arg("rank"),
+          pybind11::arg("num_ranks"), pybind11::arg("device_idx") = -1);
+    m.def("nccl_allgather_bytes", &nccl_allgather_bytes,
+          pybind11::arg("input"), pybind11::arg("output"), pybind11::arg("comm"));
+    m.def("nccl_allgather_bytes_bench", &nccl_allgather_bytes_bench,
+          pybind11::arg("input"), pybind11::arg("output"), pybind11::arg("comm"),
+          pybind11::arg("warmups"), pybind11::arg("iters"));
     m.def("stream_write_value64", &stream_write_value64,
           pybind11::arg("dst"), pybind11::arg("index"), pybind11::arg("value"));
     m.def("stream_write_value64_ptr", &stream_write_value64_ptr,

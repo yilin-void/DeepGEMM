@@ -26,7 +26,7 @@ link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib64 ${CU
 
 # The main Python API entrance
 pybind11_add_module(_C csrc/python_api.cpp)
-target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} torch_python)
+target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} torch_python nccl)
 
 # Enable kernel code indexing with CMake-based IDEs
 cuda_add_library(deep_gemm_indexing_cuda STATIC csrc/indexing/main.cu)

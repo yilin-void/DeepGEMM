@@ -76,6 +76,11 @@ def _find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _set_default_nccl_ctas() -> None:
+    os.environ.setdefault('NCCL_MIN_CTAS', '64')
+    os.environ.setdefault('NCCL_MAX_CTAS', '64')
+
+
 def _bench_ms(fn, group: dist.ProcessGroup, *, warmups: int, iters: int) -> float:
     times = []
     for _ in range(warmups):
@@ -94,6 +99,28 @@ def _bench_ms(fn, group: dist.ProcessGroup, *, warmups: int, iters: int) -> floa
     return statistics.median(times)
 
 
+def _bench_cuda_event_ms(fn, group: dist.ProcessGroup, stream: torch.cuda.Stream, *,
+                         warmups: int, iters: int) -> float:
+    times = []
+    for _ in range(warmups):
+        fn()
+        torch.cuda.synchronize()
+        dist.barrier(group=group)
+
+    for _ in range(iters):
+        dist.barrier(group=group)
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record(stream)
+        fn()
+        end.record(stream)
+        end.synchronize()
+        dist.barrier(group=group)
+        times.append(start.elapsed_time(end))
+    return statistics.median(times)
+
+
 def _max_across_ranks(value: float, group: dist.ProcessGroup) -> float:
     t = torch.tensor([value], dtype=torch.float64, device='cuda')
     dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group)
@@ -105,6 +132,13 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     if get_arch_major() != 9:
         dist_print('SM90 is required for the current rank-flag grouped GEMM path.', once_in_node=True)
         return
+
+    nccl_cpp_comm = None
+    if args.allgather_backend == 'nccl-cpp':
+        nccl_unique_ids = [deep_gemm.nccl_get_unique_id() if rank == 0 else None]
+        dist.broadcast_object_list(nccl_unique_ids, src=0, group=group)
+        nccl_cpp_comm = deep_gemm.nccl_comm_init_rank(nccl_unique_ids[0], rank, num_ranks, local_rank)
+        dist.barrier(group=group)
 
     torch.manual_seed(0x1234 + rank)
     tokens_per_rank = args.tokens_per_rank
@@ -142,12 +176,21 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         quant_config.is_fp4_a, use_ue8m0=False)
     a_local = a_global_fp8[rank * tokens_per_rank:(rank + 1) * tokens_per_rank].contiguous()
 
-    # Symmetric output buffer for the all-gathered A pool.
-    a_symm = symm_mem.empty((num_ranks, tokens_per_rank, hidden),
-                            dtype=a_local.dtype, device='cuda')
-    a_handle = symm_mem.rendezvous(a_symm, group=group)
-    a_pool = a_symm.view(total_tokens, hidden)
-    a_buffer_ptrs = [int(p) for p in a_handle.buffer_ptrs]
+    # Output buffer for the all-gathered A pool. The original overlap path uses
+    # symmetric memory so peers can P2P-pull rank slots and publish per-rank
+    # ready flags. The NCCL C++ backend is for serial baseline measurement only:
+    # the collective completes before GEMM, so no rank_flags are needed by GEMM.
+    if args.allgather_backend == 'symm':
+        a_symm = symm_mem.empty((num_ranks, tokens_per_rank, hidden),
+                                dtype=a_local.dtype, device='cuda')
+        a_handle = symm_mem.rendezvous(a_symm, group=group)
+        a_pool = a_symm.view(total_tokens, hidden)
+        a_buffer_ptrs = [int(p) for p in a_handle.buffer_ptrs]
+    else:
+        a_symm = None
+        a_handle = None
+        a_pool = torch.empty((total_tokens, hidden), dtype=a_local.dtype, device='cuda')
+        a_buffer_ptrs = None
 
     # Grouped GEMM metadata and weights.
     _rank0_print(rank, 'Building gather layout...')
@@ -176,7 +219,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     ready_flag = None
     ready_write_base_ptrs = None
     ready_wait_ptrs = None
-    if args.cross_rank_sync == 'ipc-stream':
+    if args.allgather_backend == 'symm' and args.cross_rank_sync == 'ipc-stream':
         # Each rank owns a local ready vector. After rank r finishes its local
         # D2D copy, it writes ready[r] on every peer via P2P stream mem-op.
         # Each peer waits only on its own local ready[src_rank] slot before
@@ -237,6 +280,16 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             if reserved_sms > 0:
                 deep_gemm.set_num_sms(old_num_sms)
 
+    def run_nccl_allgather() -> None:
+        with torch.cuda.stream(comm_stream):
+            deep_gemm.nccl_allgather_bytes(a_local, a_pool, nccl_cpp_comm)
+
+    def run_symm_allgather(epoch: int) -> None:
+        deep_gemm.single_node_allgather_copy_local(
+            [a_local], [a_symm], rank, rank_flags, flag_value=epoch)
+        publish_local_ready(epoch)
+        pull_after_ready(epoch)
+
     def pull_after_barrier() -> None:
         a_handle.barrier()
         deep_gemm.single_node_allgather_pull([a_symm], [a_buffer_ptrs], rank, num_ranks, rank_flags)
@@ -262,26 +315,32 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             pull_after_barrier()
 
     def run_allgather_only() -> None:
-        epoch = next_ready_epoch()
-        with torch.cuda.stream(comm_stream):
-            deep_gemm.single_node_allgather_copy_local(
-                [a_local], [a_symm], rank, rank_flags, flag_value=epoch)
-            publish_local_ready(epoch)
-            pull_after_ready(epoch)
-        torch.cuda.current_stream().wait_stream(comm_stream)
+        if args.allgather_backend == 'nccl-cpp':
+            run_nccl_allgather()
+            torch.cuda.current_stream().wait_stream(comm_stream)
+        else:
+            epoch = next_ready_epoch()
+            with torch.cuda.stream(comm_stream):
+                run_symm_allgather(epoch)
+            torch.cuda.current_stream().wait_stream(comm_stream)
 
     def run_gemm_only() -> None:
-        epoch = next_ready_epoch()
-        with torch.cuda.stream(comm_stream):
-            deep_gemm.single_node_allgather_copy_local(
-                [a_local], [a_symm], rank, rank_flags, flag_value=epoch)
-            publish_local_ready(epoch)
-            pull_after_ready(epoch)
-        with torch.cuda.stream(compute_stream):
-            compute_stream.wait_stream(comm_stream)
-            launch_gemm(epoch=epoch)
-        torch.cuda.current_stream().wait_stream(comm_stream)
-        torch.cuda.current_stream().wait_stream(compute_stream)
+        if args.allgather_backend == 'nccl-cpp':
+            run_nccl_allgather()
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_stream(comm_stream)
+                launch_gemm(with_rank_flags=False)
+            torch.cuda.current_stream().wait_stream(comm_stream)
+            torch.cuda.current_stream().wait_stream(compute_stream)
+        else:
+            epoch = next_ready_epoch()
+            with torch.cuda.stream(comm_stream):
+                run_symm_allgather(epoch)
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_stream(comm_stream)
+                launch_gemm(epoch=epoch)
+            torch.cuda.current_stream().wait_stream(comm_stream)
+            torch.cuda.current_stream().wait_stream(compute_stream)
 
     def run_gemm_no_flags() -> None:
         with torch.cuda.stream(compute_stream):
@@ -289,17 +348,22 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         torch.cuda.current_stream().wait_stream(compute_stream)
 
     def run_serial() -> None:
-        epoch = next_ready_epoch()
-        with torch.cuda.stream(comm_stream):
-            deep_gemm.single_node_allgather_copy_local(
-                [a_local], [a_symm], rank, rank_flags, flag_value=epoch)
-            publish_local_ready(epoch)
-            pull_after_ready(epoch)
-        with torch.cuda.stream(compute_stream):
-            compute_stream.wait_stream(comm_stream)
-            launch_gemm(epoch=epoch)
-        torch.cuda.current_stream().wait_stream(comm_stream)
-        torch.cuda.current_stream().wait_stream(compute_stream)
+        if args.allgather_backend == 'nccl-cpp':
+            run_nccl_allgather()
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_stream(comm_stream)
+                launch_gemm(with_rank_flags=False)
+            torch.cuda.current_stream().wait_stream(comm_stream)
+            torch.cuda.current_stream().wait_stream(compute_stream)
+        else:
+            epoch = next_ready_epoch()
+            with torch.cuda.stream(comm_stream):
+                run_symm_allgather(epoch)
+            with torch.cuda.stream(compute_stream):
+                compute_stream.wait_stream(comm_stream)
+                launch_gemm(epoch=epoch)
+            torch.cuda.current_stream().wait_stream(comm_stream)
+            torch.cuda.current_stream().wait_stream(compute_stream)
 
     def run_overlap_allgather_first() -> None:
         epoch = next_ready_epoch()
@@ -380,7 +444,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         'after-local-copy': run_overlap_after_local_copy,
         'allgather-first': run_overlap_allgather_first,
     }
-    run_overlap = overlap_fns[args.overlap_launch_order]
+    run_overlap = run_serial if args.allgather_backend == 'nccl-cpp' else overlap_fns[args.overlap_launch_order]
 
     # Compile/warm the JIT paths, fill A once, and optionally validate all-gather.
     _rank0_print(rank, 'Warming all-gather path...')
@@ -402,6 +466,9 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             dist_print(f'Rank {rank}: profiler disabled (--profile-ranks={args.profile_ranks})',
                        once_in_node=False)
 
+        _rank0_print(rank, f'Profiling config: allgather_backend={args.allgather_backend}')
+        if args.allgather_backend == 'nccl-cpp':
+            _rank0_print(rank, f'Profiling config: nccl_ctas={os.environ["NCCL_MIN_CTAS"]}/{os.environ["NCCL_MAX_CTAS"]}')
         _rank0_print(rank, 'Profiling timeline (warmup + capture)...')
 
         # Warmup outside profiler to avoid JIT noise.
@@ -444,21 +511,34 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     else:
         _rank0_print(rank, 'Benchmarking all-gather only...')
         comm_ms = _max_across_ranks(_bench_ms(run_allgather_only, group, warmups=args.warmups, iters=args.iters), group)
+        comm_event_ms = None
+        if args.allgather_backend == 'nccl-cpp':
+            comm_event_ms = _max_across_ranks(
+                _bench_cuda_event_ms(run_nccl_allgather, group, comm_stream,
+                                     warmups=args.warmups, iters=args.iters),
+                group)
         _rank0_print(rank, 'Benchmarking GEMM (no rank_flags)...')
         gemm_nf_ms = _max_across_ranks(_bench_ms(run_gemm_no_flags, group, warmups=args.warmups, iters=args.iters), group)
-        _rank0_print(rank, 'Benchmarking GEMM (with rank_flags)...')
-        gemm_ms = _max_across_ranks(_bench_ms(run_gemm_only, group, warmups=args.warmups, iters=args.iters), group)
+        gemm_ms = None
+        if args.allgather_backend == 'symm':
+            _rank0_print(rank, 'Benchmarking GEMM (with rank_flags)...')
+            gemm_ms = _max_across_ranks(_bench_ms(run_gemm_only, group, warmups=args.warmups, iters=args.iters), group)
         _rank0_print(rank, 'Benchmarking serial all-gather + GEMM...')
         serial_ms = _max_across_ranks(_bench_ms(run_serial, group, warmups=args.warmups, iters=args.iters), group)
-        _rank0_print(rank, 'Benchmarking overlapped all-gather + GEMM...')
-        overlap_ms = _max_across_ranks(_bench_ms(run_overlap, group, warmups=args.warmups, iters=args.iters), group)
+        overlap_ms = None
+        if args.allgather_backend == 'symm':
+            _rank0_print(rank, 'Benchmarking overlapped all-gather + GEMM...')
+            overlap_ms = _max_across_ranks(_bench_ms(run_overlap, group, warmups=args.warmups, iters=args.iters), group)
 
         if rank == 0:
             payload_mb = a_local.numel() * a_local.element_size() / 1e6
-            print('Single-node symmetric-memory all-gather overlap bench:', flush=True)
+            print('Single-node all-gather + grouped GEMM bench:', flush=True)
             print(f'  ranks={num_ranks}, tokens/rank={tokens_per_rank}, hidden={hidden}, '
                   f'payload/rank={payload_mb:.1f} MB', flush=True)
             print(f'  routing={routing_desc}', flush=True)
+            print(f'  allgather_backend={args.allgather_backend}', flush=True)
+            if args.allgather_backend == 'nccl-cpp':
+                print(f'  nccl_ctas={os.environ["NCCL_MIN_CTAS"]}/{os.environ["NCCL_MAX_CTAS"]}', flush=True)
             print(f'  overlap_launch_order={args.overlap_launch_order}, '
                   f'cross_rank_sync={args.cross_rank_sync}, '
                   f'overlap_reserved_sms={args.overlap_reserved_sms}, '
@@ -466,11 +546,19 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             print(f'  experts={num_experts}, top_k={top_k}, m_logical={m_logical}, '
                   f'n={args.n}, num_weights={args.num_weights}, n_eff={n_eff}', flush=True)
             print(f'  allgather only : {comm_ms * 1e3:8.2f} us', flush=True)
+            if comm_event_ms is not None:
+                print(f'  allgather event: {comm_event_ms * 1e3:8.2f} us', flush=True)
             print(f'  GEMM (no flags): {gemm_nf_ms * 1e3:8.2f} us', flush=True)
-            print(f'  GEMM (w/ flags): {gemm_ms * 1e3:8.2f} us', flush=True)
+            if gemm_ms is None:
+                print('  GEMM (w/ flags):      n/a (NCCL C++ backend has no rank_flags)', flush=True)
+            else:
+                print(f'  GEMM (w/ flags): {gemm_ms * 1e3:8.2f} us', flush=True)
             print(f'  serial         : {serial_ms * 1e3:8.2f} us', flush=True)
-            print(f'  overlap        : {overlap_ms * 1e3:8.2f} us', flush=True)
-            if serial_ms > 0:
+            if overlap_ms is None:
+                print('  overlap        :      n/a (NCCL C++ backend is serial collective)', flush=True)
+            else:
+                print(f'  overlap        : {overlap_ms * 1e3:8.2f} us', flush=True)
+            if serial_ms > 0 and overlap_ms is not None:
                 print(f'  speedup        : {serial_ms / overlap_ms:8.3f}x', flush=True)
 
     dist.destroy_process_group()
@@ -497,6 +585,10 @@ def main() -> None:
     parser.add_argument('--cross-rank-sync', type=str, default='barrier',
                         choices=('barrier', 'ipc-stream'),
                         help='barrier: use symmetric-memory global barrier; ipc-stream: per-rank CUDA IPC ready flags with cuStreamWait/WriteValue64')
+    parser.add_argument('--allgather-backend', type=str, default='symm',
+                        choices=('symm', 'nccl-cpp'),
+                        help='symm: custom symmetric-memory P2P all-gather; '
+                             'nccl-cpp: use a direct C++ ncclAllGather wrapper')
     parser.add_argument('--overlap-reserved-sms', type=int, default=2,
                         help='SMs left unused by GEMM when the selected overlap mode needs GPU-side communication progress')
     parser.add_argument('--num-weights', type=int, default=1,
@@ -516,6 +608,9 @@ def main() -> None:
                              'or "all"/"auto". auto: profile all ranks unless '
                              'ipc-stream + >=8 ranks (then rank 0 only)')
     args = parser.parse_args()
+
+    if args.allgather_backend == 'nccl-cpp':
+        _set_default_nccl_ctas()
 
     num_local_ranks = args.num_local_ranks or torch.cuda.device_count()
     assert num_local_ranks > 0
