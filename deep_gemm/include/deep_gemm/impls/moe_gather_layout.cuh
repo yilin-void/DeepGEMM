@@ -273,13 +273,14 @@ __global__ void fill_layout_tables_for_gather_layout(
 
 // -----------------------------------------------------------------------------
 // Phase 3 — Scatter: for each (token, expert_choice), atomically take a slot
-// in the (e, s) chunk and write gather_index[pos] = token_id.
+// in the (e, s) chunk and write gather_index[pos] = token_id and
+// row_to_topk[pos] = top-k slot.
 //
-// gather_index is host-pre-initialized to -1, so positions not written by this
-// pass remain `-1` and are interpreted as "pad row" by the GEMM kernel
-// (see §11.4.2). grouped_layout for those same positions is pre-filled to the
-// chunk's expert id by Phase 2b (so pad rows still produce 0·B[expert] = 0
-// rather than getting masked out).
+// gather_index and row_to_topk are host-pre-initialized to -1, so positions not
+// written by this pass remain `-1` and are interpreted as "pad row" by the GEMM
+// kernel (see §11.4.2). grouped_layout for those same positions is pre-filled
+// to the chunk's expert id by Phase 2b (so pad rows still produce 0·B[expert] =
+// 0 rather than getting masked out).
 // -----------------------------------------------------------------------------
 template <uint32_t kNumThreads>
 __global__ void scatter_for_gather_layout(
@@ -287,12 +288,14 @@ __global__ void scatter_for_gather_layout(
     const int* __restrict__ padded_starts,   // (num_experts, num_ranks) - [e][s]
     int* __restrict__ chunk_cursor,          // (num_experts, num_ranks), zero-init by host
     int* __restrict__ gather_index,          // (M_logical_max,) pre-init = -1
+    int* __restrict__ row_to_topk,           // (M_logical_max,) pre-init = -1
     uint32_t T,
     uint32_t K,
     uint32_t local_rank,
     uint32_t num_experts,
     uint32_t num_ranks,
-    uint32_t tokens_per_rank)
+    uint32_t tokens_per_rank,
+    uint32_t topk_slot_offset)
 {
     const uint32_t t = blockIdx.x * kNumThreads + threadIdx.x;
     if (t >= T) return;
@@ -309,6 +312,7 @@ __global__ void scatter_for_gather_layout(
         const int off = atomicAdd(&chunk_cursor[chunk], 1);
         const int pos = padded_starts[chunk] + off;
         gather_index[pos] = static_cast<int>(t);
+        row_to_topk[pos] = static_cast<int>(topk_slot_offset + j);
     }
 }
 

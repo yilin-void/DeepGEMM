@@ -196,11 +196,14 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     _rank0_print(rank, 'Building gather layout...')
     if args.routing_mode == 'all-ranks-local':
         routing_topk = _generate_distinct_routing_topk(total_tokens, top_k, num_experts, seed=0xBEEF)
+        topk_slot_offset = rank * top_k
     else:
         routing_topk = _generate_routing_topk(total_tokens, top_k, num_experts, seed=0xBEEF)
-    gather_index, tile_rank, grouped_layout, m_logical_t, psum_layout = \
+        topk_slot_offset = 0
+    gather_index, tile_rank, grouped_layout, m_logical_t, psum_layout, _row_to_topk = \
         deep_gemm.build_gather_layout_for_rank_overlap(
-            routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m)
+            routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m,
+            topk_slot_offset=topk_slot_offset)
     m_logical = int(m_logical_t.item())
     num_m_tiles = (m_logical + block_m - 1) // block_m
     expected_m_per_expert = int((m_logical + num_experts - 1) // num_experts * 1.2)
@@ -519,6 +522,10 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                 group)
         _rank0_print(rank, 'Benchmarking GEMM (no rank_flags)...')
         gemm_nf_ms = _max_across_ranks(_bench_ms(run_gemm_no_flags, group, warmups=args.warmups, iters=args.iters), group)
+        gemm_nf_event_ms = _max_across_ranks(
+            _bench_cuda_event_ms(run_gemm_no_flags, group, compute_stream,
+                                 warmups=args.warmups, iters=args.iters),
+            group)
         gemm_ms = None
         if args.allgather_backend == 'symm':
             _rank0_print(rank, 'Benchmarking GEMM (with rank_flags)...')
@@ -545,10 +552,12 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                   f'overlap_gemm_sms={get_reported_overlap_num_sms(deep_gemm.get_num_sms())}', flush=True)
             print(f'  experts={num_experts}, top_k={top_k}, m_logical={m_logical}, '
                   f'n={args.n}, num_weights={args.num_weights}, n_eff={n_eff}', flush=True)
-            print(f'  allgather only : {comm_ms * 1e3:8.2f} us', flush=True)
+            print('  common components:', flush=True)
+            print(f'    allgather only        : {comm_ms * 1e3:8.2f} us', flush=True)
             if comm_event_ms is not None:
-                print(f'  allgather event: {comm_event_ms * 1e3:8.2f} us', flush=True)
-            print(f'  GEMM (no flags): {gemm_nf_ms * 1e3:8.2f} us', flush=True)
+                print(f'    allgather event       : {comm_event_ms * 1e3:8.2f} us', flush=True)
+            print(f'    GEMM no rank_flags    : {gemm_nf_ms * 1e3:8.2f} us '
+                  f'(event {gemm_nf_event_ms * 1e3:8.2f} us)', flush=True)
             if gemm_ms is None:
                 print('  GEMM (w/ flags):      n/a (NCCL C++ backend has no rank_flags)', flush=True)
             else:

@@ -11,6 +11,9 @@
 #include <torch/python.h>
 
 #include "../jit/handle.hpp"
+#include "../jit_kernels/impls/combine_reduce.hpp"
+#include "../jit_kernels/impls/combine_scatter_check.hpp"
+#include "../jit_kernels/impls/combine_scatter_copy.hpp"
 #include "../utils/exception.hpp"
 
 namespace deep_gemm::comm {
@@ -33,6 +36,19 @@ static ncclComm_t get_nccl_comm_from_capsule(const pybind11::capsule& comm_capsu
     auto* ptr = comm_capsule.get_pointer();
     DG_HOST_ASSERT(ptr != nullptr);
     return reinterpret_cast<ncclComm_t>(ptr);
+}
+
+static ncclDataType_t get_nccl_dtype(const torch::Tensor& tensor) {
+    switch (tensor.scalar_type()) {
+        case torch::kFloat:
+            return ncclFloat32;
+        case torch::kBFloat16:
+            return ncclBfloat16;
+        case torch::kInt8:
+            return ncclInt8;
+        default:
+            DG_HOST_UNREACHABLE("Unsupported NCCL tensor dtype");
+    }
 }
 
 static pybind11::bytes nccl_get_unique_id() {
@@ -83,6 +99,28 @@ static void nccl_allgather_bytes(const torch::Tensor& input,
     const auto stream = static_cast<cudaStream_t>(at::cuda::getCurrentCUDAStream(input.device().index()));
     DG_NCCL_CHECK(ncclAllGather(input.data_ptr(), output.data_ptr(),
                                 static_cast<size_t>(input.nbytes()), ncclInt8, comm, stream));
+}
+
+static void nccl_reduce_scatter_sum(const torch::Tensor& input,
+                                    const torch::Tensor& output,
+                                    const pybind11::capsule& comm_capsule) {
+    DG_HOST_ASSERT(input.is_cuda() and output.is_cuda());
+    DG_HOST_ASSERT(input.is_contiguous() and output.is_contiguous());
+    DG_HOST_ASSERT(input.device() == output.device());
+    DG_HOST_ASSERT(input.scalar_type() == output.scalar_type());
+    DG_HOST_ASSERT(output.numel() > 0);
+
+    auto comm = get_nccl_comm_from_capsule(comm_capsule);
+    int num_ranks = 0;
+    DG_NCCL_CHECK(ncclCommCount(comm, &num_ranks));
+    DG_HOST_ASSERT(num_ranks > 0);
+    DG_HOST_ASSERT(input.numel() == output.numel() * static_cast<int64_t>(num_ranks));
+
+    const c10::cuda::CUDAGuard guard(input.device());
+    const auto stream = static_cast<cudaStream_t>(at::cuda::getCurrentCUDAStream(input.device().index()));
+    DG_NCCL_CHECK(ncclReduceScatter(input.data_ptr(), output.data_ptr(),
+                                    static_cast<size_t>(output.numel()), get_nccl_dtype(input),
+                                    ncclSum, comm, stream));
 }
 
 static double nccl_allgather_bytes_bench(const torch::Tensor& input,
@@ -380,6 +418,8 @@ static void register_apis(pybind11::module_& m) {
     m.def("nccl_allgather_bytes_bench", &nccl_allgather_bytes_bench,
           pybind11::arg("input"), pybind11::arg("output"), pybind11::arg("comm"),
           pybind11::arg("warmups"), pybind11::arg("iters"));
+    m.def("nccl_reduce_scatter_sum", &nccl_reduce_scatter_sum,
+          pybind11::arg("input"), pybind11::arg("output"), pybind11::arg("comm"));
     m.def("stream_write_value64", &stream_write_value64,
           pybind11::arg("dst"), pybind11::arg("index"), pybind11::arg("value"));
     m.def("stream_write_value64_ptr", &stream_write_value64_ptr,
@@ -392,6 +432,25 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("numel"));
     m.def("cuda_ipc_open_mem_handles", &cuda_ipc_open_mem_handles,
           pybind11::arg("handles"), pybind11::arg("local_rank"), pybind11::arg("local_tensor"));
+    m.def("check_combine_scatter_output", &check_combine_scatter_output,
+          pybind11::arg("d_ref"), pybind11::arg("gather_index"),
+          pybind11::arg("row_to_topk"), pybind11::arg("topk_scores"),
+          pybind11::arg("combine_buffer_ptrs"),
+          pybind11::arg("tokens_per_rank"), pybind11::arg("top_k"),
+          pybind11::arg("atol") = 0.0f);
+    m.def("combine_scatter_copy_rows", &combine_scatter_copy_rows,
+          pybind11::arg("d_ref"), pybind11::arg("gather_index"),
+          pybind11::arg("row_to_topk"), pybind11::arg("topk_scores"),
+          pybind11::arg("combine_buffer_ptrs"),
+          pybind11::arg("tokens_per_rank"), pybind11::arg("top_k"),
+          pybind11::arg("rows_per_block") = 4);
+    m.def("combine_reduce_slots", &combine_reduce_slots,
+          pybind11::arg("combine_buffer"), pybind11::arg("out"));
+    m.def("combine_pack_for_reduce_scatter", &combine_pack_for_reduce_scatter,
+          pybind11::arg("d_ref"), pybind11::arg("gather_index"),
+          pybind11::arg("row_to_topk"), pybind11::arg("topk_scores"),
+          pybind11::arg("reduce_scatter_input"),
+          pybind11::arg("tokens_per_rank"), pybind11::arg("top_k"));
     m.def("single_node_allgather_copy_local", &single_node_allgather_copy_local,
           pybind11::arg("inputs"), pybind11::arg("outputs"), pybind11::arg("local_rank"),
           pybind11::arg("rank_flags") = std::nullopt, pybind11::arg("flag_value") = 1);

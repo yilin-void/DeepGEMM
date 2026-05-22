@@ -39,7 +39,7 @@ for t in range(T):
 # ---------------------------------------------------------------------------
 # Run the generator
 # ---------------------------------------------------------------------------
-gather_index, tile_rank, grouped_layout, m_logical_t = \
+gather_index, tile_rank, grouped_layout, m_logical_t, psum_layout, row_to_topk = \
     deep_gemm.build_gather_layout_for_rank_overlap(
         routing_topk,
         local_rank=LOCAL_RANK,

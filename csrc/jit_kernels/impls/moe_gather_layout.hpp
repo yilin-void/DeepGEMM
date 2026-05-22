@@ -13,8 +13,9 @@ namespace deep_gemm {
 // =============================================================================
 // MoE gather-layout generator runtimes
 //
-// Four small kernels build (gather_index, tile_rank, grouped_layout, m_logical)
-// from a global routing-topk tensor for the per-rank-flag overlap GEMM path.
+// Four small kernels build (gather_index, tile_rank, grouped_layout, m_logical,
+// row_to_topk) from a global routing-topk tensor for the per-rank-flag overlap
+// GEMM path.
 // See `docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md` (§11) for the full
 // design rationale.
 //
@@ -122,12 +123,12 @@ static void __instantiate_kernel() {{
 };
 
 
-// Phase 3: scatter gather_index[pos] = token_id.
+// Phase 3: scatter gather_index[pos] = token_id and row_to_topk[pos] = slot.
 class GatherLayoutScatterRuntime final : public LaunchRuntime<GatherLayoutScatterRuntime> {
 public:
     struct Args {
-        void *routing_topk, *padded_starts, *chunk_cursor, *gather_index;
-        uint32_t T, K, local_rank, num_experts, num_ranks, tokens_per_rank;
+        void *routing_topk, *padded_starts, *chunk_cursor, *gather_index, *row_to_topk;
+        uint32_t T, K, local_rank, num_experts, num_ranks, tokens_per_rank, topk_slot_offset;
         LaunchArgs launch_args;
     };
 
@@ -145,8 +146,9 @@ static void __instantiate_kernel() {{
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.routing_topk, args.padded_starts, args.chunk_cursor, args.gather_index,
-            args.T, args.K, args.local_rank, args.num_experts, args.num_ranks, args.tokens_per_rank));
+            args.routing_topk, args.padded_starts, args.chunk_cursor, args.gather_index, args.row_to_topk,
+            args.T, args.K, args.local_rank, args.num_experts, args.num_ranks,
+            args.tokens_per_rank, args.topk_slot_offset));
     }
 };
 
@@ -154,13 +156,15 @@ static void __instantiate_kernel() {{
 // -----------------------------------------------------------------------------
 // Host entry: build_gather_layout_for_rank_overlap
 //
-// Returns five tensors needed by the rank-overlap GEMM path:
+// Returns six tensors needed by the rank-overlap GEMM path:
 //   gather_index:      (M_max,)           int32, pad rows = -1
 //   tile_rank:         (num_m_tiles_max,) int32
 //   grouped_layout:    (M_max,)           int32, per-row expert id (for psum=0)
 //   m_logical_tensor:  (1,)               int32, the actual padded M
 //   psum_layout:       (num_experts,)     int32, cumulative M boundary per expert
 //                      (for use_psum_layout=True — pass as grouped_layout to GEMM)
+//   row_to_topk:       (M_max,)           int32, pad rows = -1; logical row →
+//                      top-k output slot for combine-scatter experiments
 //
 // `M_max` is an analytical upper bound (tight enough that real workloads see
 // ~70% utilization on the H800 reference shape — vs. ~3.5% under the previous
@@ -181,14 +185,15 @@ static void __instantiate_kernel() {{
 // For the psum path, pass `psum_layout` as the grouped_layout argument with
 // `use_psum_layout=True`.
 // -----------------------------------------------------------------------------
-static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 build_gather_layout_for_rank_overlap(
     const torch::Tensor& routing_topk,
     const int& local_rank,
     const int& num_ranks,
     const int& tokens_per_rank,
     const int& num_experts,
-    const int& block_m)
+    const int& block_m,
+    const int& topk_slot_offset = 0)
 {
     // Input checks
     DG_HOST_ASSERT(routing_topk.dim() == 2);
@@ -199,6 +204,7 @@ build_gather_layout_for_rank_overlap(
     DG_HOST_ASSERT(num_experts > 0);
     DG_HOST_ASSERT(tokens_per_rank > 0);
     DG_HOST_ASSERT(block_m > 0);
+    DG_HOST_ASSERT(topk_slot_offset >= 0);
 
     const int T = static_cast<int>(routing_topk.size(0));
     const int K = static_cast<int>(routing_topk.size(1));
@@ -227,9 +233,10 @@ build_gather_layout_for_rank_overlap(
     // adds `block_m - 1` slack per non-empty chunk).
     const int num_m_tiles_max = ceil_div(M_max, block_m);
 
-    // Outputs: gather_index pre-filled with -1 so that any position not
-    // written by Phase 3 (scatter) automatically reads as a pad row.
+    // Outputs: gather_index/row_to_topk pre-filled with -1 so that any position
+    // not written by Phase 3 (scatter) automatically reads as a pad row.
     auto gather_index = torch::full({M_max}, -1, opts_int32);
+    auto row_to_topk = torch::full({M_max}, -1, opts_int32);
     auto tile_rank = torch::empty({num_m_tiles_max}, opts_int32);
     // grouped_layout is fully (re)written by Phase 2b; no need to pre-init.
     auto grouped_layout = torch::empty({M_max}, opts_int32);
@@ -321,12 +328,14 @@ build_gather_layout_for_rank_overlap(
             .padded_starts = padded_starts.data_ptr(),
             .chunk_cursor = chunk_cursor.data_ptr(),
             .gather_index = gather_index.data_ptr(),
+            .row_to_topk = row_to_topk.data_ptr(),
             .T = static_cast<uint32_t>(T),
             .K = static_cast<uint32_t>(K),
             .local_rank = static_cast<uint32_t>(local_rank),
             .num_experts = static_cast<uint32_t>(num_experts),
             .num_ranks = static_cast<uint32_t>(num_ranks),
             .tokens_per_rank = static_cast<uint32_t>(tokens_per_rank),
+            .topk_slot_offset = static_cast<uint32_t>(topk_slot_offset),
             .launch_args = LaunchArgs(num_blocks, num_threads),
         };
         const auto code = GatherLayoutScatterRuntime::generate(args);
@@ -346,7 +355,7 @@ build_gather_layout_for_rank_overlap(
     }
     psum_layout.slice(0, num_experts - 1, num_experts).copy_(m_logical_tensor);
 
-    return std::make_tuple(gather_index, tile_rank, grouped_layout, m_logical_tensor, psum_layout);
+    return std::make_tuple(gather_index, tile_rank, grouped_layout, m_logical_tensor, psum_layout, row_to_topk);
 }
 
 }  // namespace deep_gemm

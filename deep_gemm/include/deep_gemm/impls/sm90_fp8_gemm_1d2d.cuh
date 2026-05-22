@@ -158,6 +158,7 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
+          bool kCombineScatter,
           typename epilogue_type_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
@@ -183,6 +184,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const int* __restrict__ tile_rank,
                         uint32_t num_ranks,
                         uint64_t rank_flag_epoch,
+                        const int* __restrict__ combine_row_topk,
+                        const float* __restrict__ combine_topk_scores,
+                        const uint64_t* __restrict__ combine_buffer_ptrs,
+                        uint32_t combine_tokens_per_rank,
+                        uint32_t combine_top_k,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_d,
@@ -735,10 +741,127 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             DG_STATIC_ASSERT(BLOCK_N % TMA_D_BLOCK_N == 0 and BLOCK_N / TMA_D_BLOCK_N <= 32,
                             "Unaligned TMA store or too many TMA store instructions");
             DG_STATIC_ASSERT(TMA_D_BLOCK_N % 8 == 0, "Invalid TMA block N");
+            constexpr bool kWithGroupOffsetD = kGemmType == GemmType::MGroupedMasked;
 
             // Skip WGMMA store for the unfilled parts
             if (not do_wgmma_store)
                 continue;
+
+            if constexpr (kCombineScatter) {
+                const uint32_t base_m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
+                auto get_scatter_base_and_score = [&](uint32_t logical_m, float& score) -> nv_bfloat16* {
+                    score = 0.0f;
+                    if (logical_m >= shape_m)
+                        return nullptr;
+                    const int src_token_i = gather_index == nullptr
+                        ? static_cast<int>(logical_m)
+                        : __ldg(gather_index + logical_m);
+                    const int topk_i = __ldg(combine_row_topk + logical_m);
+                    if (src_token_i < 0 or topk_i < 0)
+                        return nullptr;
+                    if (combine_tokens_per_rank == 0 or
+                        static_cast<uint32_t>(topk_i) >= combine_top_k)
+                        return nullptr;
+
+                    const uint32_t src_token = static_cast<uint32_t>(src_token_i);
+                    const uint32_t src_rank = src_token / combine_tokens_per_rank;
+                    if (src_rank >= num_ranks)
+                        return nullptr;
+                    const uint32_t local_token = src_token - src_rank * combine_tokens_per_rank;
+                    const uint64_t peer_base_u64 = __ldg(combine_buffer_ptrs + src_rank);
+                    auto* peer_base = reinterpret_cast<nv_bfloat16*>(peer_base_u64);
+                    score = __ldg(combine_topk_scores +
+                                  static_cast<uint64_t>(src_token) * combine_top_k +
+                                  static_cast<uint32_t>(topk_i));
+                    const uint64_t dst_row_offset =
+                        (static_cast<uint64_t>(local_token) * combine_top_k +
+                         static_cast<uint32_t>(topk_i)) * shape_n;
+                    return peer_base + dst_row_offset;
+                };
+
+                // Stage the WGMMA fragment into a row-major shared-memory tile first.
+                // Direct BF16x2 peer stores from accumulator lanes are easy to wire up,
+                // but they issue many small global stores. The row-major staging below
+                // lets the CTA copy the tile out with 16B vectorized stores instead.
+                #pragma unroll
+                for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
+                    const uint32_t m_offset = local_idx * WAVE_BLOCK_M;
+                    auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                        auto* smem_ptr = reinterpret_cast<uint8_t*>(
+                            smem_d + (m_offset + warp_idx * WGMMA_M_PER_WARP + lane_idx) * BLOCK_N + i * 8);
+                        ptx::SM90_U32x2_STSM_N<nv_bfloat162>::copy(
+                            __float22bfloat162_rn({shifted_accum[i * 4 + 0], shifted_accum[i * 4 + 1]}),
+                            __float22bfloat162_rn({shifted_accum[i * 4 + 2], shifted_accum[i * 4 + 3]}),
+                            smem_ptr
+                        );
+                    }
+                }
+                cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 1);
+
+                constexpr uint32_t kScatterVecElems = 8;
+                DG_STATIC_ASSERT(BLOCK_N % kScatterVecElems == 0, "Invalid vectorized scatter store shape");
+                constexpr uint32_t kVecsPerRow = BLOCK_N / kScatterVecElems;
+
+                auto scatter_vec = [&](nv_bfloat16* dst_base, uint32_t row, uint32_t vec, float score) {
+                    const uint32_t col = n_block_idx * BLOCK_N + vec * kScatterVecElems;
+                    if (dst_base == nullptr or col >= shape_n)
+                        return;
+
+                    const auto* src = smem_d + row * BLOCK_N + vec * kScatterVecElems;
+                    const uint32_t dst_col = epilogue_type_t::template apply_index_n<kScatterVecElems>(col);
+                    if (col + kScatterVecElems <= shape_n) {
+                        uint4 packed;
+                        auto* packed_bf16 = reinterpret_cast<nv_bfloat16*>(&packed);
+                        #pragma unroll
+                        for (uint32_t elem = 0; elem < kScatterVecElems; ++elem)
+                            packed_bf16[elem] = __float2bfloat16_rn(__bfloat162float(src[elem]) * score);
+                        *reinterpret_cast<uint4*>(dst_base + dst_col) = packed;
+                    } else {
+                        #pragma unroll
+                        for (uint32_t elem = 0; elem < kScatterVecElems; ++elem) {
+                            if (col + elem < shape_n)
+                                dst_base[dst_col + elem] =
+                                    __float2bfloat16_rn(__bfloat162float(src[elem]) * score);
+                        }
+                    }
+                };
+
+                for (uint32_t linear = threadIdx.x; linear < BLOCK_M * kVecsPerRow;
+                     linear += kNumWGMMAStoreThreads) {
+                    const uint32_t row = linear / kVecsPerRow;
+                    const uint32_t vec = linear - row * kVecsPerRow;
+                    nv_bfloat16* dst_base = nullptr;
+                    float score = 0.0f;
+                    if constexpr (32 % kVecsPerRow == 0) {
+                        const uint32_t leader_lane = lane_idx - (lane_idx % kVecsPerRow);
+                        uint32_t dst_base_lo = 0, dst_base_hi = 0;
+                        uint32_t score_bits = 0;
+                        if (lane_idx == leader_lane) {
+                            float leader_score = 0.0f;
+                            const uint64_t dst_base_u64 =
+                                reinterpret_cast<uint64_t>(
+                                    get_scatter_base_and_score(base_m_idx + row, leader_score));
+                            dst_base_lo = static_cast<uint32_t>(dst_base_u64);
+                            dst_base_hi = static_cast<uint32_t>(dst_base_u64 >> 32);
+                            score_bits = __float_as_uint(leader_score);
+                        }
+                        dst_base_lo = __shfl_sync(0xffffffff, dst_base_lo, leader_lane);
+                        dst_base_hi = __shfl_sync(0xffffffff, dst_base_hi, leader_lane);
+                        score_bits = __shfl_sync(0xffffffff, score_bits, leader_lane);
+                        const uint64_t dst_base_u64 =
+                            (static_cast<uint64_t>(dst_base_hi) << 32) | dst_base_lo;
+                        dst_base = reinterpret_cast<nv_bfloat16*>(dst_base_u64);
+                        score = __uint_as_float(score_bits);
+                    } else {
+                        dst_base = get_scatter_base_and_score(base_m_idx + row, score);
+                    }
+                    scatter_vec(dst_base, row, vec, score);
+                }
+                cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 1);
+                continue;
+            }
 
             // Wait last TMA store to be finished
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N)
@@ -796,7 +919,6 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
             // Use TMA store to write back to global memory
             // TODO: compatible with FP32 output
-            constexpr bool kWithGroupOffsetD = kGemmType == GemmType::MGroupedMasked;
             DG_STATIC_ASSERT(kNumWGMMAStoreThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
                 auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N;

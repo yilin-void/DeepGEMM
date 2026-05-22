@@ -1,0 +1,76 @@
+#pragma once
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include <deep_gemm/common/utils.cuh>
+
+namespace deep_gemm {
+
+template <uint32_t kNumThreads>
+__global__ void combine_reduce_slots_kernel(
+    const __nv_bfloat16* __restrict__ combine_buffer,
+    float* __restrict__ out,
+    uint32_t tokens_per_rank,
+    uint32_t top_k,
+    uint32_t n) {
+    const uint64_t total = static_cast<uint64_t>(tokens_per_rank) * n;
+    for (uint64_t idx = static_cast<uint64_t>(blockIdx.x) * kNumThreads + threadIdx.x;
+         idx < total;
+         idx += static_cast<uint64_t>(gridDim.x) * kNumThreads) {
+        const uint32_t token = static_cast<uint32_t>(idx / n);
+        const uint32_t col = static_cast<uint32_t>(idx - static_cast<uint64_t>(token) * n);
+        float acc = 0.0f;
+        #pragma unroll 1
+        for (uint32_t slot = 0; slot < top_k; ++slot) {
+            const uint64_t offset =
+                (static_cast<uint64_t>(token) * top_k + slot) * n + col;
+            acc += __bfloat162float(combine_buffer[offset]);
+        }
+        out[idx] = acc;
+    }
+}
+
+template <uint32_t kNumThreads>
+__global__ void combine_pack_for_reduce_scatter_kernel(
+    const __nv_bfloat16* __restrict__ d_ref,
+    const int* __restrict__ gather_index,
+    const int* __restrict__ row_to_topk,
+    const float* __restrict__ topk_scores,
+    float* __restrict__ reduce_scatter_input,
+    uint32_t m,
+    uint32_t n,
+    uint32_t tokens_per_rank,
+    uint32_t top_k,
+    uint32_t num_ranks) {
+    const uint64_t total = static_cast<uint64_t>(m) * n;
+    for (uint64_t idx = static_cast<uint64_t>(blockIdx.x) * kNumThreads + threadIdx.x;
+         idx < total;
+         idx += static_cast<uint64_t>(gridDim.x) * kNumThreads) {
+        const uint32_t row = static_cast<uint32_t>(idx / n);
+        const uint32_t col = static_cast<uint32_t>(idx - static_cast<uint64_t>(row) * n);
+
+        const int src_token_i = __ldg(gather_index + row);
+        const int topk_i = __ldg(row_to_topk + row);
+        if (src_token_i < 0 or topk_i < 0)
+            continue;
+        if (tokens_per_rank == 0 or static_cast<uint32_t>(topk_i) >= top_k)
+            continue;
+
+        const uint32_t src_token = static_cast<uint32_t>(src_token_i);
+        const uint32_t src_rank = src_token / tokens_per_rank;
+        if (src_rank >= num_ranks)
+            continue;
+        const uint32_t local_token = src_token - src_rank * tokens_per_rank;
+        const float score = __ldg(topk_scores +
+                                  static_cast<uint64_t>(src_token) * top_k +
+                                  static_cast<uint32_t>(topk_i));
+        const float value = __bfloat162float(
+            __float2bfloat16_rn(__bfloat162float(d_ref[idx]) * score));
+        const uint64_t dst_offset =
+            (static_cast<uint64_t>(src_rank) * tokens_per_rank + local_token) * n + col;
+        atomicAdd(reduce_scatter_input + dst_offset, value);
+    }
+}
+
+}  // namespace deep_gemm

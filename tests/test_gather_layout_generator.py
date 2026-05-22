@@ -211,7 +211,7 @@ def test_gather_layout_generator():
                                                   seed=0xfade ^ local_rank)
 
             # GPU
-            gpu_gather, gpu_tile, gpu_glayout, gpu_m_t = \
+            gpu_gather, gpu_tile, gpu_glayout, gpu_m_t, gpu_psum, gpu_row_topk = \
                 deep_gemm.build_gather_layout_for_rank_overlap(
                     routing_topk, local_rank, num_ranks, tpr, num_experts, block_m)
             torch.cuda.synchronize()
@@ -258,6 +258,14 @@ def test_gather_layout_generator():
             assert ok, (f'gather_index mismatch: {msg} '
                         f'(num_ranks={num_ranks}, tpr={tpr}, n_experts={num_experts}, '
                         f'local_rank={local_rank})')
+            gpu_row_topk_used = gpu_row_topk[:gpu_m]
+            assert torch.equal(gpu_row_topk_used[gpu_gather[:gpu_m] < 0],
+                               torch.full_like(gpu_row_topk_used[gpu_gather[:gpu_m] < 0], -1))
+            real_topk = gpu_row_topk_used[gpu_gather[:gpu_m] >= 0]
+            assert ((real_topk >= 0) & (real_topk < top_k)).all(), \
+                (f'row_to_topk out of range '
+                 f'(num_ranks={num_ranks}, tpr={tpr}, n_experts={num_experts}, '
+                 f'local_rank={local_rank})')
 
             n_pad = (gpu_gather[:gpu_m] == -1).sum().item()
             print(f'  > nr={num_ranks}, tpr={tpr:5}, ne={num_experts:3}, k={top_k}, '
@@ -301,7 +309,7 @@ def test_gather_layout_with_gemm():
                                                   seed=0xbeef ^ local_rank)
 
             # Build the layout
-            gather_index, tile_rank, grouped_layout, m_logical_t = \
+            gather_index, tile_rank, grouped_layout, m_logical_t, psum_layout, row_to_topk = \
                 deep_gemm.build_gather_layout_for_rank_overlap(
                     routing_topk, local_rank, num_ranks, tpr, num_experts, block_m)
             m_logical = int(m_logical_t.item())
@@ -343,6 +351,7 @@ def test_gather_layout_with_gemm():
                 rank_flags=rank_flags,
                 tile_rank=tile_rank[: m_logical // block_m],
                 num_ranks=num_ranks,
+                rank_flag_epoch=1,
             )
             torch.cuda.synchronize()
 
