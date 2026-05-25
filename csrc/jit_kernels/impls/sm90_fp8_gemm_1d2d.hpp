@@ -32,6 +32,7 @@ public:
         uint32_t stride_sfa;  // MN-major: K-scale stride; raw row-major: row stride
         bool sfa_is_mn_major; // compile-time specialization selector
         void *gather_index;   // optional int32 row remap for A/sfa; nullptr keeps logical rows
+        void *combine_src_index;  // optional int32 row -> source token map for combine-scatter
         // Per-rank ready-flag overlap (optional): set all three together. See
         // docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md for the contract.
         void *rank_flags;     // (num_ranks,) int64 on device; nullptr disables overlap
@@ -101,7 +102,7 @@ static void __instantiate_kernel() {{
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.gmem_a, args.stride_a,
             args.gmem_sfa, args.stride_sfa,
-            args.gather_index,
+            args.gather_index, args.combine_src_index,
             args.rank_flags, args.tile_rank, args.num_ranks, args.rank_flag_epoch,
             args.combine_row_topk, args.combine_buffer_ptrs,
             args.combine_tokens_per_rank, args.combine_top_k,
@@ -222,6 +223,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .stride_sfa = stride_sfa_elems,
         .sfa_is_mn_major = true,
         .gather_index = gather_index.has_value() ? gather_index->data_ptr() : nullptr,
+        .combine_src_index = nullptr,
         .rank_flags = has_overlap ? rank_flags->data_ptr() : nullptr,
         .tile_rank = has_overlap ? tile_rank->data_ptr() : nullptr,
         .num_ranks = has_overlap ? static_cast<uint32_t>(num_ranks.value()) : 0u,
@@ -256,6 +258,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const std::optional<torch::Tensor>& tile_rank = std::nullopt,
                                                     const std::optional<int>& num_ranks = std::nullopt,
                                                     const std::optional<int64_t>& rank_flag_epoch = std::nullopt,
+                                                    const std::optional<torch::Tensor>& combine_src_index = std::nullopt,
                                                     const std::optional<torch::Tensor>& combine_row_topk = std::nullopt,
                                                     const std::optional<torch::Tensor>& combine_buffer_ptrs = std::nullopt,
                                                     const std::optional<int>& combine_tokens_per_rank = std::nullopt,
@@ -287,12 +290,18 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         DG_HOST_ASSERT(not tile_rank.has_value() and not num_ranks.has_value());
     }
     // Optional combine-scatter writes the GEMM result directly to per-source-rank
-    // output slots. It still relies on gather_index to recover the source token.
+    // output slots. It uses combine_src_index to recover the source token; for
+    // old gather-A callers, gather_index is accepted as the same source map.
     const bool has_combine_scatter = combine_row_topk.has_value();
+    const auto& effective_combine_src_index = combine_src_index.has_value() ? combine_src_index : gather_index;
     if (has_combine_scatter) {
-        DG_HOST_ASSERT(gather_index.has_value() and "combine-scatter requires gather_index");
+        DG_HOST_ASSERT(effective_combine_src_index.has_value() and
+                       "combine-scatter requires combine_src_index or gather_index");
         DG_HOST_ASSERT(combine_buffer_ptrs.has_value());
         DG_HOST_ASSERT(combine_tokens_per_rank.has_value() and combine_top_k.has_value());
+        DG_HOST_ASSERT(effective_combine_src_index->is_cuda() and effective_combine_src_index->is_contiguous());
+        DG_HOST_ASSERT(effective_combine_src_index->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(effective_combine_src_index->numel() >= m);
         DG_HOST_ASSERT(combine_row_topk->is_cuda() and combine_row_topk->is_contiguous());
         DG_HOST_ASSERT(combine_row_topk->scalar_type() == torch::kInt);
         DG_HOST_ASSERT(combine_row_topk->numel() >= m);
@@ -303,6 +312,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         DG_HOST_ASSERT(combine_tokens_per_rank.value() > 0);
         DG_HOST_ASSERT(combine_top_k.value() > 0);
     } else {
+        DG_HOST_ASSERT(not combine_src_index.has_value());
         DG_HOST_ASSERT(not combine_buffer_ptrs.has_value());
         DG_HOST_ASSERT(not combine_tokens_per_rank.has_value());
         DG_HOST_ASSERT(not combine_top_k.has_value());
@@ -359,13 +369,15 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                config.storage_config.swizzle_cd_mode);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, config.layout.block_k, 1, 0);
+    const int combine_scatter_smem_size = has_combine_scatter ?
+        config.layout.block_m * static_cast<int>(sizeof(uint64_t)) : 0;
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
         .gemm_desc = desc,
         .gemm_config = config,
         .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
+                                  config.pipeline_config.smem_size + combine_scatter_smem_size,
                                   config.layout.get_cluster_size()),
         .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
@@ -377,6 +389,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .stride_sfa = stride_sfa_elems,
         .sfa_is_mn_major = sfa_is_mn_major,
         .gather_index = gather_index.has_value() ? gather_index->data_ptr() : nullptr,
+        .combine_src_index = has_combine_scatter ? effective_combine_src_index->data_ptr() : nullptr,
         .rank_flags = has_overlap ? rank_flags->data_ptr() : nullptr,
         .tile_rank = has_overlap ? tile_rank->data_ptr() : nullptr,
         .num_ranks = has_overlap ? static_cast<uint32_t>(num_ranks.value()) :
@@ -461,6 +474,7 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .stride_sfa = stride_sfa_elems,
         .sfa_is_mn_major = true,
         .gather_index = nullptr,
+        .combine_src_index = nullptr,
         .rank_flags = nullptr,
         .tile_rank = nullptr,
         .num_ranks = 0u,
@@ -550,6 +564,7 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .stride_sfa = stride_sfa_elems,
         .sfa_is_mn_major = true,
         .gather_index = nullptr,
+        .combine_src_index = nullptr,
         .rank_flags = nullptr,
         .tile_rank = nullptr,
         .num_ranks = 0u,

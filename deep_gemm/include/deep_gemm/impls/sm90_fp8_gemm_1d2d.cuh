@@ -169,6 +169,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const float* __restrict__ gmem_sfa,
                         uint32_t stride_sfa,        // MN-major: K-scale stride; raw row-major: row stride
                         const int* __restrict__ gather_index,
+                        const int* __restrict__ combine_src_index,
                         // Per-rank ready-flag overlap (optional). All four must be set together
                         // (or all unset). See docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
                         //   rank_flags      : (num_ranks,) int64 on global memory; written to
@@ -196,7 +197,6 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     static_assert(not kHasRankFlags or kHasGatherIndex, "rank flags require gather_index");
-    static_assert(not kCombineScatter or kHasGatherIndex, "combine-scatter requires gather_index");
 
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
@@ -279,15 +279,13 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     // spin on rank_flags[r] with ld.acquire.sys. The elected thread writes
     // s_rank_seen[r] = 1 after the spin so subsequent tiles skip via cache hit.
     //
-    // Lives in dynamic smem after the barriers; the host's smem_size reservation
-    // for `kNumMaxStages * 8 * 3` barriers (see `get_pipeline_config` in
-    // sm90.hpp) leaves >256 B slack vs. the actual `2 * kNumStages` barriers we
-    // use, so 32 B for `s_rank_seen` fits without bumping `smem_size`.
+    // Lives in dynamic smem after the barriers. The host's base smem reservation
+    // leaves enough barrier slack for `s_rank_seen`; combine-scatter launches add
+    // one `uint64_t` per M row for `s_combine_scatter_base`.
     static constexpr uint32_t kNumRanksMax = 8;
     auto smem_tail = reinterpret_cast<uint8_t*>(barrier_start_ptr + 2 * kNumStages);
-    uint32_t* s_rank_seen = nullptr;
-    if constexpr (kHasRankFlags)
-        s_rank_seen = reinterpret_cast<uint32_t*>(smem_tail);
+    auto s_rank_seen = reinterpret_cast<uint32_t*>(smem_tail);
+    auto s_combine_scatter_base = reinterpret_cast<uint64_t*>(s_rank_seen + kNumRanksMax);
 
 #if DG_BARRIER_DEBUG
     // Diagnose SMEM layout: print offsets and total usage (block 0, thread 0 only).
@@ -637,6 +635,34 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            constexpr bool kWithGroupOffsetD = kGemmType == GemmType::MGroupedMasked;
+            if constexpr (kCombineScatter) {
+                const uint32_t base_m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
+                for (uint32_t row = threadIdx.x; row < BLOCK_M; row += kNumMathThreads) {
+                    const uint32_t logical_m = base_m_idx + row;
+                    uint64_t dst_base_u64 = 0;
+                    if (logical_m < shape_m) {
+                        const int src_token_i = __ldg(combine_src_index + logical_m);
+                        const int topk_i = __ldg(combine_row_topk + logical_m);
+                        if (src_token_i >= 0 and topk_i >= 0 and
+                            combine_tokens_per_rank != 0 and
+                            static_cast<uint32_t>(topk_i) < combine_top_k) {
+                            const uint32_t src_token = static_cast<uint32_t>(src_token_i);
+                            const uint32_t src_rank = src_token / combine_tokens_per_rank;
+                            if (src_rank < num_ranks) {
+                                const uint32_t local_token = src_token - src_rank * combine_tokens_per_rank;
+                                const uint64_t peer_base_u64 = __ldg(combine_buffer_ptrs + src_rank);
+                                const uint64_t dst_row_offset =
+                                    (static_cast<uint64_t>(local_token) * combine_top_k +
+                                     static_cast<uint32_t>(topk_i)) * shape_n;
+                                dst_base_u64 = peer_base_u64 + dst_row_offset * sizeof(nv_bfloat16);
+                            }
+                        }
+                    }
+                    s_combine_scatter_base[row] = dst_base_u64;
+                }
+            }
+
             // Decide the number of scales B to load
             DG_TRAP_ONLY_DEVICE_ASSERT(shape_n % 8 == 0);
             uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
@@ -784,40 +810,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             DG_STATIC_ASSERT(BLOCK_N % TMA_D_BLOCK_N == 0 and BLOCK_N / TMA_D_BLOCK_N <= 32,
                             "Unaligned TMA store or too many TMA store instructions");
             DG_STATIC_ASSERT(TMA_D_BLOCK_N % 8 == 0, "Invalid TMA block N");
-            constexpr bool kWithGroupOffsetD = kGemmType == GemmType::MGroupedMasked;
-
             // Skip WGMMA store for the unfilled parts
             if (not do_wgmma_store)
                 continue;
 
             if constexpr (kCombineScatter) {
-                const uint32_t base_m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
-                auto get_scatter_base = [&](uint32_t logical_m) -> nv_bfloat16* {
-                    if (logical_m >= shape_m)
-                        return nullptr;
-                    const int src_token_i = gather_index == nullptr
-                        ? static_cast<int>(logical_m)
-                        : __ldg(gather_index + logical_m);
-                    const int topk_i = __ldg(combine_row_topk + logical_m);
-                    if (src_token_i < 0 or topk_i < 0)
-                        return nullptr;
-                    if (combine_tokens_per_rank == 0 or
-                        static_cast<uint32_t>(topk_i) >= combine_top_k)
-                        return nullptr;
-
-                    const uint32_t src_token = static_cast<uint32_t>(src_token_i);
-                    const uint32_t src_rank = src_token / combine_tokens_per_rank;
-                    if (src_rank >= num_ranks)
-                        return nullptr;
-                    const uint32_t local_token = src_token - src_rank * combine_tokens_per_rank;
-                    const uint64_t peer_base_u64 = __ldg(combine_buffer_ptrs + src_rank);
-                    auto* peer_base = reinterpret_cast<nv_bfloat16*>(peer_base_u64);
-                    const uint64_t dst_row_offset =
-                        (static_cast<uint64_t>(local_token) * combine_top_k +
-                         static_cast<uint32_t>(topk_i)) * shape_n;
-                    return peer_base + dst_row_offset;
-                };
-
                 // Stage the WGMMA fragment into a row-major shared-memory tile first.
                 // Direct BF16x2 peer stores from accumulator lanes are easy to wire up,
                 // but they issue many small global stores. The row-major staging below
@@ -875,9 +872,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const uint32_t leader_lane = lane_idx - (lane_idx % kVecsPerRow);
                         uint32_t dst_base_lo = 0, dst_base_hi = 0;
                         if (lane_idx == leader_lane) {
-                            const uint64_t dst_base_u64 =
-                                reinterpret_cast<uint64_t>(
-                                    get_scatter_base(base_m_idx + row));
+                            const uint64_t dst_base_u64 = s_combine_scatter_base[row];
                             dst_base_lo = static_cast<uint32_t>(dst_base_u64);
                             dst_base_hi = static_cast<uint32_t>(dst_base_u64 >> 32);
                         }
@@ -887,7 +882,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                             (static_cast<uint64_t>(dst_base_hi) << 32) | dst_base_lo;
                         dst_base = reinterpret_cast<nv_bfloat16*>(dst_base_u64);
                     } else {
-                        dst_base = get_scatter_base(base_m_idx + row);
+                        dst_base = reinterpret_cast<nv_bfloat16*>(s_combine_scatter_base[row]);
                     }
                     scatter_vec(dst_base, row, vec);
                 }

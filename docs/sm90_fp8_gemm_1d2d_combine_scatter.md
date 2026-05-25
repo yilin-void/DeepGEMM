@@ -66,7 +66,7 @@ out[token, :] = sum_j combine_buffer[token, j, :] * topk_scores[token, j]
 
 ```text
 GEMM output row m
-  └──> source token = gather_index[m]
+  └──> source token = combine_src_index[m]
   └──> source rank  = source token / tokens_per_rank
   └──> local token  = source token % tokens_per_rank
   └──> topk slot    = row_to_topk[m]
@@ -90,7 +90,7 @@ source rank 本地 token 对应的 top-k score。
 
 2. scatter-copy kernel:
      读取 D[m, :]
-     根据 gather_index[m]、row_to_topk[m]
+     根据 combine_src_index[m]、row_to_topk[m]
      写到 source rank 的 combine_buffer[token, slot, :]
 
 3. local reduction kernel:
@@ -136,9 +136,10 @@ global store。
 
 ### 3.1 GEMM API 扩展
 
-`m_grouped_fp8_fp4_gemm_nt_contiguous` 新增 4 个 optional 参数：
+`m_grouped_fp8_fp4_gemm_nt_contiguous` 新增 combine-scatter 相关 optional 参数：
 
 ```c++
+combine_src_index:        Optional[Tensor[int32]]
 combine_row_topk:         Optional[Tensor[int32]]
 combine_buffer_ptrs:      Optional[Tensor[int64]]
 combine_tokens_per_rank:  Optional[int]
@@ -146,13 +147,15 @@ combine_top_k:            Optional[int]
 ```
 
 当 `combine_row_topk` 非空时，GEMM 进入 combine-scatter epilogue；否则保持原有
-TMA store D 的行为。
+TMA store D 的行为。`combine_src_index` 可不传；这种情况下实现会复用
+`gather_index` 作为 source-token map，以兼容原来的 GEMM1-style 调用。
 
 ### 3.2 输入含义
 
 | 参数 | 形状 / 类型 | 含义 |
 | --- | --- | --- |
-| `gather_index` | `(M,) int32 CUDA contiguous` | output row 到 global source token 的映射 |
+| `gather_index` | optional `(M,) int32 CUDA contiguous` | output row 到 A/SFA source row 的映射；为空时 A 已按 grouped row 排好 |
+| `combine_src_index` | optional `(M,) int32 CUDA contiguous` | output row 到 global source token 的映射；为空时回退使用 `gather_index` |
 | `combine_row_topk` | `(M,) int32 CUDA contiguous` | output row 最终写入的 top-k slot |
 | `combine_buffer_ptrs` | `(num_ranks,) int64 CUDA contiguous` | 每个 source rank 的 combine buffer device pointer |
 | `combine_tokens_per_rank` | scalar int | 每个 rank 的 token 数 |
@@ -167,7 +170,7 @@ TMA store D 的行为。
 device 侧写入位置：
 
 ```c++
-src_token   = gather_index[row]
+src_token   = combine_src_index[row]
 src_rank    = src_token / combine_tokens_per_rank
 local_token = src_token - src_rank * combine_tokens_per_rank
 topk_slot   = combine_row_topk[row]
@@ -191,7 +194,7 @@ out[token, col] = sum_slot bf16(combine_buffer[token, slot, col]) * topk_scores[
 
 - 只覆盖 SM90 FP8 1D2D m-grouped contiguous 路径。
 - 输出 dtype 当前按 BF16 处理。
-- `combine-scatter` 必须和 `gather_index` 一起使用。
+- `combine-scatter` 必须提供 `combine_src_index` 或 `gather_index` 中的一个。
 - `combine_buffer_ptrs.numel() <= 8`。
 - `N % 8 == 0`，因为 epilogue 使用 16B `uint4` store（8 个 BF16）。
 - multi-rank benchmark 中，`combine-scatter` 只允许 `all-ranks-local` routing。
@@ -206,53 +209,62 @@ out[token, col] = sum_slot bf16(combine_buffer[token, slot, col]) * topk_scores[
 
 ### 4.1 JIT 入口
 
-host runtime 里用 `combine_row_topk != nullptr` 作为编译期模板参数：
+host runtime 里用两个指针状态作为编译期模板参数：
 
 ```c++
+args.gather_index != nullptr      // -> kGatherA
 args.combine_row_topk != nullptr  // -> kCombineScatter
 ```
 
 这意味着：
 
+- `kGatherA` 控制 producer WG 是否用 `gather_index` 间接读取 A/SFA。
 - 不带 combine-scatter 的 kernel 不会携带额外 epilogue 分支。
 - 带 combine-scatter 的 kernel 在 epilogue 中不再走 TMA store D，而是走
   scatter store。
 
+这个拆分用于 GEMM2-style 路径：GEMM1 已经把 token 按 grouped row 连续排布，
+后续 GEMM2 的 A/SFA 可以直接按 logical row 读取，但 combine-scatter 仍然需要知道
+每一行最终属于哪个 source token。因此此时传入 `gather_index = None`、
+`combine_src_index = row -> source token`。
+
 ### 4.2 epilogue 目标地址计算
 
-kernel 端先为每个 logical row 计算目标 row base：
+kernel 端在每个 tile 开始时先为每个 logical row 计算目标 row base，并写入
+shared memory。后面的 scatter loop 只读取预计算好的 base address，避免在 epilogue
+store 热路径里反复做 source-token / top-k / peer-buffer 查表。
 
 ```c++
-auto get_scatter_base = [&](uint32_t logical_m) -> nv_bfloat16* {
-    if (logical_m >= shape_m)
-        return nullptr;
+for (uint32_t row = threadIdx.x; row < BLOCK_M; row += kNumMathThreads) {
+    const uint32_t logical_m = base_m_idx + row;
+    uint64_t dst_base_u64 = 0;
+    if (logical_m >= shape_m) {
+        s_combine_scatter_base[row] = 0;
+        continue;
+    }
 
-    const int src_token_i = gather_index == nullptr
-        ? static_cast<int>(logical_m)
-        : __ldg(gather_index + logical_m);
+    const int src_token_i = __ldg(combine_src_index + logical_m);
     const int topk_i = __ldg(combine_row_topk + logical_m);
-    if (src_token_i < 0 or topk_i < 0)
-        return nullptr;
-    if (combine_tokens_per_rank == 0 or
-        static_cast<uint32_t>(topk_i) >= combine_top_k)
-        return nullptr;
-
-    const uint32_t src_token = static_cast<uint32_t>(src_token_i);
-    const uint32_t src_rank = src_token / combine_tokens_per_rank;
-    if (src_rank >= num_ranks)
-        return nullptr;
-
-    const uint32_t local_token = src_token - src_rank * combine_tokens_per_rank;
-    const uint64_t peer_base_u64 = __ldg(combine_buffer_ptrs + src_rank);
-    auto* peer_base = reinterpret_cast<nv_bfloat16*>(peer_base_u64);
-    const uint64_t dst_row_offset =
-        (static_cast<uint64_t>(local_token) * combine_top_k +
-         static_cast<uint32_t>(topk_i)) * shape_n;
-    return peer_base + dst_row_offset;
-};
+    if (src_token_i >= 0 and topk_i >= 0 and
+        combine_tokens_per_rank != 0 and
+        static_cast<uint32_t>(topk_i) < combine_top_k) {
+        const uint32_t src_token = static_cast<uint32_t>(src_token_i);
+        const uint32_t src_rank = src_token / combine_tokens_per_rank;
+        if (src_rank < num_ranks) {
+            const uint32_t local_token = src_token - src_rank * combine_tokens_per_rank;
+            const uint64_t peer_base_u64 = __ldg(combine_buffer_ptrs + src_rank);
+            const uint64_t dst_row_offset =
+                (static_cast<uint64_t>(local_token) * combine_top_k +
+                 static_cast<uint32_t>(topk_i)) * shape_n;
+            dst_base_u64 = peer_base_u64 + dst_row_offset * sizeof(nv_bfloat16);
+        }
+    }
+    s_combine_scatter_base[row] = dst_base_u64;
+}
 ```
 
-pad row 或非法 top-k slot 会返回 `nullptr`，后续 scatter store 直接跳过。
+pad row 或非法 top-k slot 会写入 0，后续 scatter store 把它解释为 `nullptr`
+并直接跳过。
 
 `combine_buffer_ptrs` 通过 CUDA IPC 暴露给 peer rank。这里需要保留 PyTorch caching
 allocator 的 base allocation offset：IPC handle 对应的是 allocation base，而 tensor
@@ -286,7 +298,7 @@ for (uint32_t linear = threadIdx.x; linear < BLOCK_M * kVecsPerRow;
      linear += kNumWGMMAStoreThreads) {
     row = linear / kVecsPerRow;
     vec = linear - row * kVecsPerRow;
-    dst_base = get_scatter_base(base_m_idx + row);
+    dst_base = reinterpret_cast<nv_bfloat16*>(s_combine_scatter_base[row]);
     scatter_vec(dst_base, row, vec);
 }
 ```
@@ -325,12 +337,12 @@ if constexpr (kCombineScatter) {
 
 ### 4.5 row_to_topk 来自哪里
 
-`row_to_topk` 由 `build_gather_layout_for_rank_overlap` 生成。它和
-`gather_index` 一一对应：
+`row_to_topk` 由 `build_gather_layout_for_rank_overlap` 生成。它和 source-token
+map 一一对应；当前 benchmark 中这个 map 叫 `combine_src_index`：
 
 ```text
 logical row m:
-    gather_index[m] -> source token
+    combine_src_index[m] -> source token
     grouped_layout[m] -> local expert
     row_to_topk[m] -> final top-k slot
 ```
@@ -359,7 +371,7 @@ topk_slot_offset = rank * local_top_k
 
 ```text
 d_ref                 // 非 scatter GEMM 写出的本地参考 D
-gather_index
+combine_src_index
 row_to_topk
 combine_buffer_ptrs
 tokens_per_rank
@@ -381,7 +393,7 @@ benchmark 在 reduce-scatter correctness 路径里还会额外检查 owner rank 
 无法单独发现的 IPC offset / owner-read 问题。
 
 此外，`--check` 默认会为每个 rank 的前 32 个 local tokens 构造 CPU arithmetic
-reference。每个 rank 在 CPU 上用普通 GEMM 输出 `D`、`gather_index`、
+reference。每个 rank 在 CPU 上用普通 GEMM 输出 `D`、`combine_src_index`、
 `row_to_topk` 和 `topk_scores` 计算：
 
 ```text
@@ -430,7 +442,7 @@ fused:
 ```
 
 `combine_pack_for_reduce_scatter` 从普通 GEMM 的本地 `D[M, N]` 读取每个 grouped row，
-按 `gather_index[row]` 找到 source rank/token，按 `row_to_topk[row]` 取 score，
+按 `combine_src_index[row]` 找到 source rank/token，按 `row_to_topk[row]` 取 score，
 把 `bf16(D[row, col]) * score` atomic add 到 float32 `rs_input[src_rank, token, col]`。
 随后 `nccl_reduce_scatter_sum` 对 float32 `rs_input` 做 SUM，每个 source rank 收到
 自己的 `[tokens_per_rank, N]`。
@@ -466,6 +478,7 @@ tests/bench_combine_scatter.py
 ```bash
 --bench-standalone-scatter    # 同时跑 standalone scatter-copy 和 two-stage baseline
 --bench-reduce-scatter        # 同时跑 GEMM + pack/local-reduce + NCCL reduce-scatter baseline
+--no-gather-a                 # GEMM2-style：A/SFA 已按 grouped row 连续排布
 --scatter-rows-per-block      # standalone scatter-copy 的 rows/CTA，默认 4
 ```
 
@@ -486,30 +499,46 @@ slots，避免 random routing 下的写冲突。
 - `NCCL_MIN_CTAS=64 NCCL_MAX_CTAS=64`
 - routing 使用 `all-ranks-local`
 
+当前目标 shape：
+
+```text
+global tokens = 55808
+local routed rows before expert padding = 55808 * 2 = 111616
+intermediate hidden = 1280
+hidden = 2048
+```
+
+对应到 benchmark 参数：
+
+```text
+tokens_per_rank = 55808 / 8 = 6976
+hidden           = 1280   # GEMM K, fc2 input/intermediate dimension
+n                = 2048   # GEMM N, fc2 output/hidden dimension
+```
+
 主要命令：
 
 ```bash
 NCCL_MIN_CTAS=64 NCCL_MAX_CTAS=64 \
 python3 tests/bench_combine_scatter.py \
   --num-local-ranks 8 \
-  --tokens-per-rank 7351 \
-  --hidden 2048 \
-  --n 2560 \
+  --tokens-per-rank 6976 \
+  --hidden 1280 \
+  --n 2048 \
   --top-k 16 \
   --global-num-experts 512 \
   --experts-per-rank-token 2 \
+  --no-gather-a \
   --bench-standalone-scatter \
   --bench-reduce-scatter \
-  --warmups 3 \
-  --iters 5 \
-  --check \
-  --cpu-ref-tokens 32
+  --warmups 10 \
+  --iters 20
 ```
 
 log：
 
 ```text
-workspace/logs/combine_scatter_score_local_reduce_h200_8.log
+workspace/logs/bench_combine_scatter_gemm2_target_h200.log
 ```
 
 ### 6.2 结果
@@ -518,12 +547,13 @@ workspace/logs/combine_scatter_score_local_reduce_h200_8.log
 
 ```text
 ranks = 8
-tokens/rank = 7351
-hidden = 2048
+tokens/rank = 6976
+hidden = 1280
 global_top_k = 16
 local_top_k = 2
-m_logical = 133120
-n = 2560
+m_logical = 131328
+n = 2048
+gather_a = false
 ```
 
 结果按方案拆分如下。表里 `total` 是直接测整条路径的 median，不是把各组件 median
@@ -531,39 +561,44 @@ n = 2560
 
 | 方案 | 组件 | 时间 |
 | --- | --- | ---: |
-| common | GEMM no scatter | 1470.81 us (event 1433.12 us) |
-| fused scatter | fused GEMM + raw scatter | 2217.91 us (event 2200.67 us) |
-| two-stage scatter-copy | GEMM no scatter | 1470.81 us (event 1433.12 us) |
-| two-stage scatter-copy | raw scatter-copy | 1593.96 us (event 1550.24 us) |
-| two-stage scatter-copy | total GEMM + scatter-copy | 3012.71 us (event 2966.05 us) |
-| reduce-scatter baseline | GEMM no scatter | 1470.81 us (event 1433.12 us) |
-| reduce-scatter baseline | pack/local-reduce | 1726.50 us (event 1680.19 us) |
-| reduce-scatter baseline | NCCL reduce-scatter SUM | 1557.96 us (event 1516.32 us) |
-| reduce-scatter baseline | total GEMM + pack + RS | 5040.37 us |
-| fused scatter + local reduction | fused GEMM + raw scatter | 2217.91 us (event 2200.67 us) |
-| fused scatter + local reduction | scored local reduction | 539.96 us (event 497.79 us) |
-| fused scatter + local reduction | total fused + local reduction | 2684.78 us |
+| common | GEMM no scatter | 867.71 us (event 824.72 us) |
+| fused scatter | fused GEMM + raw scatter | 1634.20 us (event 1566.21 us) |
+| two-stage scatter-copy | GEMM no scatter | 867.71 us (event 824.72 us) |
+| two-stage scatter-copy | raw scatter-copy | 1230.10 us (event 1182.38 us, 386.66 GB/s) |
+| two-stage scatter-copy | total GEMM + scatter-copy | 2025.61 us (event 1980.83 us) |
+| reduce-scatter baseline | GEMM no scatter | 867.71 us (event 824.72 us) |
+| reduce-scatter baseline | pack/local-reduce | 1332.01 us (event 1289.18 us) |
+| reduce-scatter baseline | NCCL reduce-scatter SUM | 1201.28 us (event 1157.58 us, alg-bw 345.57 GB/s) |
+| reduce-scatter baseline | total GEMM + pack + RS | 3281.74 us |
+| fused scatter + local reduction | fused GEMM + raw scatter | 1634.20 us (event 1566.21 us) |
+| fused scatter + local reduction | scored local reduction | 422.82 us (event 381.58 us) |
+| fused scatter + local reduction | total fused + local reduction | 2068.58 us |
 
 correctness：
 
 ```text
-fused scatter + local reduction vs GEMM + pack/local-reduce + reduce-scatter
-max_abs_diff = 0.000152588
-mismatches   = 0  (rtol=1e-2, atol=2e-2)
+Fused combine-scatter epilogue value check:
+max_abs_diff = 0
+mismatches   = 0
+
+CPU reference check for fused scatter + local reduction:
+max_abs_diff = 9.15527e-05
+tokens       = 16
+mismatches   = 0
 ```
 
 standalone scatter-copy 写入数据量：
 
 ```text
 tokens_per_rank * top_k * n * sizeof(bf16)
-= 7351 * 16 * 2560 * 2
-= 602,193,920 bytes
+= 6976 * 16 * 2048 * 2
+= 457,179,136 bytes
 ```
 
 对应带宽：
 
 ```text
-602.2 MB / 1.55024 ms = 388.45 GB/s
+457.2 MB / 1.18238 ms = 386.66 GB/s
 ```
 
 ### 6.3 解读
@@ -571,24 +606,24 @@ tokens_per_rank * top_k * n * sizeof(bf16)
 以 two-stage 为 baseline：
 
 ```text
-two-stage event       ≈ 2966 us
-fused combine-scatter ≈ 2201 us
+two-stage event       ≈ 1981 us
+fused combine-scatter ≈ 1566 us
 ```
 
-fused epilogue 省掉约 `765 us`，约 `1.35x`。这说明 fused 路径确实把独立
+fused epilogue 省掉约 `415 us`，约 `1.26x`。这说明 fused 路径确实把独立
 scatter-copy 的大部分成本藏进了 GEMM epilogue，而不是简单地把通信原样追加到
 GEMM 后面。
 
 如果看完整 combine 对比：
 
 ```text
-GEMM + pack/local-reduce + reduce-scatter ≈ 5040 us
-fused combine-scatter + local reduction   ≈ 2685 us
+GEMM + pack/local-reduce + reduce-scatter ≈ 3282 us
+fused combine-scatter + local reduction   ≈ 2069 us
 ```
 
-当前 fused 路径快约 `1.88x`。不过这个结论要谨慎解读：reduce-scatter baseline
-里的 pack/local-reduce kernel 目前是朴素 atomic 实现，单独就要约 `1680 us` event；
-NCCL reduce-scatter 本身约 `1515 us` event。因此这条 baseline 现在更多用于建立数学等价
+当前 fused 路径快约 `1.59x`。不过这个结论要谨慎解读：reduce-scatter baseline
+里的 pack/local-reduce kernel 目前是朴素 atomic 实现，单独就要约 `1289 us` event；
+NCCL reduce-scatter 本身约 `1158 us` event。因此这条 baseline 现在更多用于建立数学等价
 验证和性能参照，不能代表充分优化后的 reduce-scatter 方案上限。
 
 但 fused 仍然显著慢于“不做 scatter 的 GEMM”。同形状不带 combine-scatter 的历史
@@ -598,7 +633,13 @@ baseline 为：
 GEMM without scatter ≈ 1470.81 us
 ```
 
-因此当前 fused epilogue 仍然额外引入约 `747 us` wall time，或约 `768 us` event。
+GEMM2-style no-gather A、target shape 的当前 baseline 为：
+
+```text
+GEMM without scatter ≈ 867.71 us
+```
+
+因此当前 fused epilogue 仍然额外引入约 `766 us` wall time，或约 `741 us` event。
 score multiply 已经移到 local reduction，fused epilogue 的额外成本主要来自
 `accumulator -> shared memory -> 16B peer store` 这条写回路径以及 remote store 本身。
 

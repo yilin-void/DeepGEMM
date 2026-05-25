@@ -196,6 +196,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  const std::optional<torch::Tensor>& tile_rank = std::nullopt,
                                                  const std::optional<int>& num_ranks = std::nullopt,
                                                  const std::optional<int64_t>& rank_flag_epoch = std::nullopt,
+                                                 const std::optional<torch::Tensor>& combine_src_index = std::nullopt,
                                                  const std::optional<torch::Tensor>& combine_row_topk = std::nullopt,
                                                  const std::optional<torch::Tensor>& combine_buffer_ptrs = std::nullopt,
                                                  const std::optional<int>& combine_tokens_per_rank = std::nullopt,
@@ -235,11 +236,17 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         DG_HOST_ASSERT(not tile_rank.has_value() and not num_ranks.has_value());
     }
     const bool has_combine_scatter = combine_row_topk.has_value();
+    const auto& effective_combine_src_index = combine_src_index.has_value() ? combine_src_index : gather_index;
     if (has_combine_scatter) {
-        DG_HOST_ASSERT(gather_index.has_value() and "combine-scatter requires gather_index");
+        DG_HOST_ASSERT(effective_combine_src_index.has_value() and
+                       "combine-scatter requires combine_src_index or gather_index");
         DG_HOST_ASSERT(combine_buffer_ptrs.has_value());
         DG_HOST_ASSERT(combine_tokens_per_rank.has_value() and combine_top_k.has_value());
+        DG_HOST_ASSERT(effective_combine_src_index->is_cuda() and effective_combine_src_index->is_contiguous());
+        DG_HOST_ASSERT(effective_combine_src_index->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(effective_combine_src_index->numel() >= m_d);
     } else {
+        DG_HOST_ASSERT(not combine_src_index.has_value());
         DG_HOST_ASSERT(not combine_buffer_ptrs.has_value());
         DG_HOST_ASSERT(not combine_tokens_per_rank.has_value());
         DG_HOST_ASSERT(not combine_top_k.has_value());
@@ -298,10 +305,12 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     // Dispatch implementation
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         const auto major_sfb = get_major_type_ab(sfb);
+        const std::optional<torch::Tensor> empty_combine_src_index = std::nullopt;
         sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
                                                 compiled_dims, use_psum_layout, expected_m_for_psum_layout,
                                                 gather_index, rank_flags, tile_rank, num_ranks, rank_flag_epoch,
+                                                has_combine_scatter ? effective_combine_src_index : empty_combine_src_index,
                                                 combine_row_topk, combine_buffer_ptrs,
                                                 combine_tokens_per_rank, combine_top_k);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
@@ -753,6 +762,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("tile_rank") = std::nullopt,
           py::arg("num_ranks") = std::nullopt,
           py::arg("rank_flag_epoch") = std::nullopt,
+          py::arg("combine_src_index") = std::nullopt,
           py::arg("combine_row_topk") = std::nullopt,
           py::arg("combine_buffer_ptrs") = std::nullopt,
           py::arg("combine_tokens_per_rank") = std::nullopt,
