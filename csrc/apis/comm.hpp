@@ -1,9 +1,11 @@
 #pragma once
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <nccl.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -29,6 +31,11 @@ do { \
     } \
 } while (0)
 #endif
+
+static std::vector<std::shared_ptr<void>>& cuda_ipc_lifetime_store() {
+    static std::vector<std::shared_ptr<void>> store;
+    return store;
+}
 
 constexpr const char* kNcclCommCapsuleName = "deep_gemm.nccl_comm";
 
@@ -235,6 +242,19 @@ static pybind11::bytes cuda_ipc_get_mem_handle(const torch::Tensor& tensor) {
     DG_HOST_ASSERT(tensor.nbytes() > 0);
 
     const c10::cuda::CUDAGuard guard(tensor.device());
+    try {
+        const auto shareable = c10::cuda::CUDACachingAllocator::shareIpcHandle(tensor.data_ptr());
+        const int64_t offset = static_cast<int64_t>(shareable.offset);
+        std::string payload(sizeof(offset) + shareable.handle.size(), '\0');
+        std::memcpy(payload.data(), &offset, sizeof(offset));
+        std::memcpy(payload.data() + sizeof(offset), shareable.handle.data(), shareable.handle.size());
+        return pybind11::bytes(payload);
+    } catch (const c10::Error&) {
+        // Tensors created from raw cudaMalloc (e.g. cuda_ipc_alloc_i64) are not
+        // owned by the PyTorch caching allocator. They are allocation-base
+        // pointers already, so the legacy raw CUDA IPC handle is sufficient.
+    }
+
     cudaIpcMemHandle_t handle;
     DG_CUDA_RUNTIME_CHECK(cudaIpcGetMemHandle(&handle, tensor.data_ptr()));
     return pybind11::bytes(reinterpret_cast<const char*>(&handle), sizeof(handle));
@@ -273,12 +293,31 @@ static std::vector<int64_t> cuda_ipc_open_mem_handles(const std::vector<pybind11
         }
 
         const std::string bytes = handles[i];
-        DG_HOST_ASSERT(bytes.size() == sizeof(cudaIpcMemHandle_t));
+        if (bytes.size() > sizeof(int64_t) + sizeof(cudaIpcMemHandle_t)) {
+            int64_t offset = 0;
+            std::memcpy(&offset, bytes.data(), sizeof(offset));
+            auto handle = bytes.substr(sizeof(offset));
+            auto dev_ptr = c10::cuda::CUDACachingAllocator::getIpcDevPtr(std::move(handle));
+            auto ptr = reinterpret_cast<uintptr_t>(dev_ptr.get()) + static_cast<uintptr_t>(offset);
+            cuda_ipc_lifetime_store().push_back(std::move(dev_ptr));
+            ptrs[i] = static_cast<int64_t>(ptr);
+            continue;
+        }
+
+        const char* handle_data = bytes.data();
+        size_t handle_size = bytes.size();
+        int64_t offset = 0;
+        if (bytes.size() == sizeof(offset) + sizeof(cudaIpcMemHandle_t)) {
+            std::memcpy(&offset, bytes.data(), sizeof(offset));
+            handle_data = bytes.data() + sizeof(offset);
+            handle_size = bytes.size() - sizeof(offset);
+        }
+        DG_HOST_ASSERT(handle_size == sizeof(cudaIpcMemHandle_t));
         cudaIpcMemHandle_t handle;
-        std::memcpy(&handle, bytes.data(), sizeof(handle));
+        std::memcpy(&handle, handle_data, sizeof(handle));
         void* ptr = nullptr;
         DG_CUDA_RUNTIME_CHECK(cudaIpcOpenMemHandle(&ptr, handle, cudaIpcMemLazyEnablePeerAccess));
-        ptrs[i] = static_cast<int64_t>(reinterpret_cast<uintptr_t>(ptr));
+        ptrs[i] = static_cast<int64_t>(reinterpret_cast<uintptr_t>(ptr) + static_cast<uintptr_t>(offset));
     }
     return ptrs;
 }
@@ -434,18 +473,17 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("handles"), pybind11::arg("local_rank"), pybind11::arg("local_tensor"));
     m.def("check_combine_scatter_output", &check_combine_scatter_output,
           pybind11::arg("d_ref"), pybind11::arg("gather_index"),
-          pybind11::arg("row_to_topk"), pybind11::arg("topk_scores"),
-          pybind11::arg("combine_buffer_ptrs"),
+          pybind11::arg("row_to_topk"), pybind11::arg("combine_buffer_ptrs"),
           pybind11::arg("tokens_per_rank"), pybind11::arg("top_k"),
           pybind11::arg("atol") = 0.0f);
     m.def("combine_scatter_copy_rows", &combine_scatter_copy_rows,
           pybind11::arg("d_ref"), pybind11::arg("gather_index"),
-          pybind11::arg("row_to_topk"), pybind11::arg("topk_scores"),
-          pybind11::arg("combine_buffer_ptrs"),
+          pybind11::arg("row_to_topk"), pybind11::arg("combine_buffer_ptrs"),
           pybind11::arg("tokens_per_rank"), pybind11::arg("top_k"),
           pybind11::arg("rows_per_block") = 4);
     m.def("combine_reduce_slots", &combine_reduce_slots,
-          pybind11::arg("combine_buffer"), pybind11::arg("out"));
+          pybind11::arg("combine_buffer"), pybind11::arg("topk_scores"),
+          pybind11::arg("out"));
     m.def("combine_pack_for_reduce_scatter", &combine_pack_for_reduce_scatter,
           pybind11::arg("d_ref"), pybind11::arg("gather_index"),
           pybind11::arg("row_to_topk"), pybind11::arg("topk_scores"),

@@ -197,7 +197,6 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  const std::optional<int>& num_ranks = std::nullopt,
                                                  const std::optional<int64_t>& rank_flag_epoch = std::nullopt,
                                                  const std::optional<torch::Tensor>& combine_row_topk = std::nullopt,
-                                                 const std::optional<torch::Tensor>& combine_topk_scores = std::nullopt,
                                                  const std::optional<torch::Tensor>& combine_buffer_ptrs = std::nullopt,
                                                  const std::optional<int>& combine_tokens_per_rank = std::nullopt,
                                                  const std::optional<int>& combine_top_k = std::nullopt) {
@@ -238,11 +237,9 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     const bool has_combine_scatter = combine_row_topk.has_value();
     if (has_combine_scatter) {
         DG_HOST_ASSERT(gather_index.has_value() and "combine-scatter requires gather_index");
-        DG_HOST_ASSERT(combine_topk_scores.has_value());
         DG_HOST_ASSERT(combine_buffer_ptrs.has_value());
         DG_HOST_ASSERT(combine_tokens_per_rank.has_value() and combine_top_k.has_value());
     } else {
-        DG_HOST_ASSERT(not combine_topk_scores.has_value());
         DG_HOST_ASSERT(not combine_buffer_ptrs.has_value());
         DG_HOST_ASSERT(not combine_tokens_per_rank.has_value());
         DG_HOST_ASSERT(not combine_top_k.has_value());
@@ -305,7 +302,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
                                                 compiled_dims, use_psum_layout, expected_m_for_psum_layout,
                                                 gather_index, rank_flags, tile_rank, num_ranks, rank_flag_epoch,
-                                                combine_row_topk, combine_topk_scores, combine_buffer_ptrs,
+                                                combine_row_topk, combine_buffer_ptrs,
                                                 combine_tokens_per_rank, combine_top_k);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         DG_HOST_ASSERT(not gather_index.has_value());
@@ -757,7 +754,6 @@ static void register_apis(pybind11::module_& m) {
           py::arg("num_ranks") = std::nullopt,
           py::arg("rank_flag_epoch") = std::nullopt,
           py::arg("combine_row_topk") = std::nullopt,
-          py::arg("combine_topk_scores") = std::nullopt,
           py::arg("combine_buffer_ptrs") = std::nullopt,
           py::arg("combine_tokens_per_rank") = std::nullopt,
           py::arg("combine_top_k") = std::nullopt);

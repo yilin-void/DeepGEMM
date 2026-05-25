@@ -42,7 +42,6 @@ public:
         // each GEMM output row is stored to peer_buffers[src_rank]
         // [local_token, topk_slot, n].
         void *combine_row_topk;      // (m,) int32; nullptr disables combine-scatter
-        void *combine_topk_scores;   // (num_ranks * tokens_per_rank, top_k) float32
         void *combine_buffer_ptrs;   // (num_ranks,) int64/uint64 device pointer table
         uint32_t combine_tokens_per_rank;
         uint32_t combine_top_k;
@@ -104,7 +103,7 @@ static void __instantiate_kernel() {{
             args.gmem_sfa, args.stride_sfa,
             args.gather_index,
             args.rank_flags, args.tile_rank, args.num_ranks, args.rank_flag_epoch,
-            args.combine_row_topk, args.combine_topk_scores, args.combine_buffer_ptrs,
+            args.combine_row_topk, args.combine_buffer_ptrs,
             args.combine_tokens_per_rank, args.combine_top_k,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_d, args.tensor_map_sfa));
@@ -228,7 +227,6 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .num_ranks = has_overlap ? static_cast<uint32_t>(num_ranks.value()) : 0u,
         .rank_flag_epoch = has_overlap ? static_cast<uint64_t>(rank_flag_epoch.value()) : 0ULL,
         .combine_row_topk = nullptr,
-        .combine_topk_scores = nullptr,
         .combine_buffer_ptrs = nullptr,
         .combine_tokens_per_rank = 0u,
         .combine_top_k = 0u,
@@ -259,7 +257,6 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const std::optional<int>& num_ranks = std::nullopt,
                                                     const std::optional<int64_t>& rank_flag_epoch = std::nullopt,
                                                     const std::optional<torch::Tensor>& combine_row_topk = std::nullopt,
-                                                    const std::optional<torch::Tensor>& combine_topk_scores = std::nullopt,
                                                     const std::optional<torch::Tensor>& combine_buffer_ptrs = std::nullopt,
                                                     const std::optional<int>& combine_tokens_per_rank = std::nullopt,
                                                     const std::optional<int>& combine_top_k = std::nullopt) {
@@ -294,26 +291,18 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     const bool has_combine_scatter = combine_row_topk.has_value();
     if (has_combine_scatter) {
         DG_HOST_ASSERT(gather_index.has_value() and "combine-scatter requires gather_index");
-        DG_HOST_ASSERT(combine_topk_scores.has_value());
         DG_HOST_ASSERT(combine_buffer_ptrs.has_value());
         DG_HOST_ASSERT(combine_tokens_per_rank.has_value() and combine_top_k.has_value());
         DG_HOST_ASSERT(combine_row_topk->is_cuda() and combine_row_topk->is_contiguous());
         DG_HOST_ASSERT(combine_row_topk->scalar_type() == torch::kInt);
         DG_HOST_ASSERT(combine_row_topk->numel() >= m);
-        DG_HOST_ASSERT(combine_topk_scores->is_cuda() and combine_topk_scores->is_contiguous());
-        DG_HOST_ASSERT(combine_topk_scores->scalar_type() == torch::kFloat);
-        DG_HOST_ASSERT(combine_topk_scores->dim() == 2);
         DG_HOST_ASSERT(combine_buffer_ptrs->is_cuda() and combine_buffer_ptrs->is_contiguous());
         DG_HOST_ASSERT(combine_buffer_ptrs->scalar_type() == torch::kLong);
         DG_HOST_ASSERT(combine_buffer_ptrs->numel() > 0 and combine_buffer_ptrs->numel() <= 8);
         DG_HOST_ASSERT(n % 8 == 0 and "combine-scatter requires N to be 16-byte aligned");
         DG_HOST_ASSERT(combine_tokens_per_rank.value() > 0);
         DG_HOST_ASSERT(combine_top_k.value() > 0);
-        DG_HOST_ASSERT(combine_topk_scores->size(0) >=
-                       static_cast<int64_t>(combine_tokens_per_rank.value()) * combine_buffer_ptrs->numel());
-        DG_HOST_ASSERT(combine_topk_scores->size(1) >= combine_top_k.value());
     } else {
-        DG_HOST_ASSERT(not combine_topk_scores.has_value());
         DG_HOST_ASSERT(not combine_buffer_ptrs.has_value());
         DG_HOST_ASSERT(not combine_tokens_per_rank.has_value());
         DG_HOST_ASSERT(not combine_top_k.has_value());
@@ -394,7 +383,6 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                      (has_combine_scatter ? static_cast<uint32_t>(combine_buffer_ptrs->numel()) : 0u),
         .rank_flag_epoch = has_overlap ? static_cast<uint64_t>(rank_flag_epoch.value()) : 0ULL,
         .combine_row_topk = has_combine_scatter ? combine_row_topk->data_ptr() : nullptr,
-        .combine_topk_scores = has_combine_scatter ? combine_topk_scores->data_ptr() : nullptr,
         .combine_buffer_ptrs = has_combine_scatter ? combine_buffer_ptrs->data_ptr() : nullptr,
         .combine_tokens_per_rank = has_combine_scatter ? static_cast<uint32_t>(combine_tokens_per_rank.value()) : 0u,
         .combine_top_k = has_combine_scatter ? static_cast<uint32_t>(combine_top_k.value()) : 0u,
@@ -478,7 +466,6 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .num_ranks = 0u,
         .rank_flag_epoch = 0ULL,
         .combine_row_topk = nullptr,
-        .combine_topk_scores = nullptr,
         .combine_buffer_ptrs = nullptr,
         .combine_tokens_per_rank = 0u,
         .combine_top_k = 0u,
@@ -568,7 +555,6 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .num_ranks = 0u,
         .rank_flag_epoch = 0ULL,
         .combine_row_topk = nullptr,
-        .combine_topk_scores = nullptr,
         .combine_buffer_ptrs = nullptr,
         .combine_tokens_per_rank = 0u,
         .combine_top_k = 0u,

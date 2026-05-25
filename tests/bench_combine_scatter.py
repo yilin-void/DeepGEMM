@@ -5,10 +5,10 @@ same deterministic full A pool so the measured paths focus on fc2 output
 movement and combine:
 
   1. GEMM no scatter
-  2. fused GEMM + score + P2P scatter
-  3. GEMM + standalone score scatter-copy
+  2. fused GEMM + raw P2P scatter
+  3. GEMM + standalone raw scatter-copy
   4. GEMM + pack/local-reduce + NCCL reduce-scatter
-  5. fused GEMM + score scatter + source-rank local reduction
+  5. fused GEMM + raw scatter + scored source-rank local reduction
 """
 
 import argparse
@@ -179,6 +179,8 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     d = torch.empty((m_logical, n_eff), dtype=torch.bfloat16, device='cuda')
     torch.manual_seed(0x3456)
     combine_topk_scores = torch.rand((total_tokens, combine_top_k), dtype=torch.float32, device='cuda')
+    local_topk_scores = combine_topk_scores[
+        rank * tokens_per_rank:(rank + 1) * tokens_per_rank, :combine_top_k].contiguous()
 
     combine_buffer = torch.empty((tokens_per_rank, combine_top_k, n_eff),
                                  dtype=torch.bfloat16, device='cuda')
@@ -202,7 +204,6 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         kw = {}
         if enable_combine_scatter:
             kw.update(combine_row_topk=row_to_topk,
-                      combine_topk_scores=combine_topk_scores,
                       combine_buffer_ptrs=combine_buffer_ptrs_t,
                       combine_tokens_per_rank=tokens_per_rank,
                       combine_top_k=combine_top_k)
@@ -229,7 +230,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     def run_standalone_scatter() -> None:
         with torch.cuda.stream(compute_stream):
             deep_gemm.combine_scatter_copy_rows(
-                d, gather_index, row_to_topk, combine_topk_scores, combine_buffer_ptrs_t,
+                d, gather_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, args.scatter_rows_per_block)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
@@ -237,7 +238,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         with torch.cuda.stream(compute_stream):
             launch_gemm(enable_combine_scatter=False)
             deep_gemm.combine_scatter_copy_rows(
-                d, gather_index, row_to_topk, combine_topk_scores, combine_buffer_ptrs_t,
+                d, gather_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, args.scatter_rows_per_block)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
@@ -269,7 +270,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
 
     def run_local_reduce_only() -> None:
         with torch.cuda.stream(compute_stream):
-            deep_gemm.combine_reduce_slots(combine_buffer, fused_reduce_output)
+            deep_gemm.combine_reduce_slots(combine_buffer, local_topk_scores, fused_reduce_output)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
     def run_fused_scatter_then_local_reduce() -> None:
@@ -298,7 +299,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             torch.cuda.synchronize()
             dist.barrier(group=group)
             max_diff_t, mismatch_count_t = deep_gemm.check_combine_scatter_output(
-                d, gather_index, row_to_topk, combine_topk_scores, combine_buffer_ptrs_t,
+                d, gather_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, 0.0)
             torch.cuda.synchronize()
             dist.all_reduce(max_diff_t, op=dist.ReduceOp.MAX, group=group)
@@ -319,20 +320,42 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             run_reduce_scatter_baseline()
             torch.cuda.synchronize()
             dist.barrier(group=group)
-            run_fused_scatter_then_local_reduce()
+            run_fused_scatter()
+            torch.cuda.synchronize()
+            dist.barrier(group=group)
+            combine_nonfinite_count_t = (~torch.isfinite(combine_buffer)).sum().reshape(1)
+            dist.all_reduce(combine_nonfinite_count_t, op=dist.ReduceOp.SUM, group=group)
+            combine_nonfinite_count = int(combine_nonfinite_count_t.item())
+            if combine_nonfinite_count != 0:
+                raise AssertionError(f'Fused combine buffer has non-finite values: count={combine_nonfinite_count}')
+            run_local_reduce_only()
             torch.cuda.synchronize()
             dist.barrier(group=group)
             diff = (fused_reduce_output - reduce_scatter_output).abs()
             tolerance = args.reduce_check_atol + args.reduce_check_rtol * reduce_scatter_output.abs()
-            max_diff_t = diff.max().reshape(1)
-            mismatch_count_t = (diff > tolerance).sum().reshape(1)
+            nonfinite = ~torch.isfinite(diff)
+            finite_diff = torch.nan_to_num(diff, nan=float('inf'), posinf=float('inf'), neginf=float('inf'))
+            max_diff_t = finite_diff.max().reshape(1)
+            mismatch_count_t = (nonfinite | (finite_diff > tolerance)).sum().reshape(1)
+            nonfinite_diff_count_t = nonfinite.sum().reshape(1)
+            fused_nonfinite_count_t = (~torch.isfinite(fused_reduce_output)).sum().reshape(1)
+            baseline_nonfinite_count_t = (~torch.isfinite(reduce_scatter_output)).sum().reshape(1)
             dist.all_reduce(max_diff_t, op=dist.ReduceOp.MAX, group=group)
             dist.all_reduce(mismatch_count_t, op=dist.ReduceOp.SUM, group=group)
+            dist.all_reduce(nonfinite_diff_count_t, op=dist.ReduceOp.SUM, group=group)
+            dist.all_reduce(fused_nonfinite_count_t, op=dist.ReduceOp.SUM, group=group)
+            dist.all_reduce(baseline_nonfinite_count_t, op=dist.ReduceOp.SUM, group=group)
             max_diff = float(max_diff_t.item())
             mismatch_count = int(mismatch_count_t.item())
+            nonfinite_diff_count = int(nonfinite_diff_count_t.item())
+            fused_nonfinite_count = int(fused_nonfinite_count_t.item())
+            baseline_nonfinite_count = int(baseline_nonfinite_count_t.item())
             if mismatch_count != 0:
                 raise AssertionError(
                     f'Reduce-scatter baseline mismatch: count={mismatch_count}, max_abs_diff={max_diff}, '
+                    f'nonfinite_diff={nonfinite_diff_count}, '
+                    f'fused_nonfinite={fused_nonfinite_count}, '
+                    f'baseline_nonfinite={baseline_nonfinite_count}, '
                     f'rtol={args.reduce_check_rtol}, atol={args.reduce_check_atol}')
             _rank0_print(rank, f'Reduce-scatter baseline check passed: max_abs_diff={max_diff:.6g}, '
                          f'mismatches=0')
@@ -433,7 +456,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             print('  two-stage scatter-copy scheme:', flush=True)
             print(f'    GEMM no scatter       : {gemm_no_scatter_ms * 1e3:8.2f} us '
                   f'(event {gemm_no_scatter_event_ms * 1e3:8.2f} us)', flush=True)
-            print(f'    score+scatter-copy    : {standalone_scatter_ms * 1e3:8.2f} us '
+            print(f'    scatter-copy          : {standalone_scatter_ms * 1e3:8.2f} us '
                   f'(event {standalone_scatter_event_ms * 1e3:8.2f} us, '
                   f'{scatter_bw:7.2f} GB/s)', flush=True)
             print(f'    total GEMM+scatter    : {two_stage_scatter_ms * 1e3:8.2f} us '

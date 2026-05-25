@@ -12,7 +12,6 @@ __global__ void combine_scatter_copy_rows_kernel(
     const __nv_bfloat16* __restrict__ d_ref,
     const int* __restrict__ gather_index,
     const int* __restrict__ row_to_topk,
-    const float* __restrict__ topk_scores,
     const uint64_t* __restrict__ combine_buffer_ptrs,
     uint32_t m,
     uint32_t n,
@@ -47,9 +46,6 @@ __global__ void combine_scatter_copy_rows_kernel(
         const uint32_t local_token = src_token - src_rank * tokens_per_rank;
         const uint64_t peer_base_u64 = __ldg(combine_buffer_ptrs + src_rank);
         auto* peer_base = reinterpret_cast<__nv_bfloat16*>(peer_base_u64);
-        const float score = __ldg(topk_scores +
-                                  static_cast<uint64_t>(src_token) * top_k +
-                                  static_cast<uint32_t>(topk_i));
         const uint64_t dst_row_offset =
             (static_cast<uint64_t>(local_token) * top_k + static_cast<uint32_t>(topk_i)) * n;
 
@@ -62,12 +58,12 @@ __global__ void combine_scatter_copy_rows_kernel(
             const uint32_t col = vec * kVecElems;
             #pragma unroll
             for (uint32_t elem = 0; elem < kVecElems; ++elem)
-                packed_bf16[elem] = __float2bfloat16_rn(__bfloat162float(src[col + elem]) * score);
+                packed_bf16[elem] = src[col + elem];
             reinterpret_cast<uint4*>(dst)[vec] = packed;
         }
 
         for (uint32_t col = tail_start + threadIdx.x; col < n; col += kNumThreads)
-            dst[col] = __float2bfloat16_rn(__bfloat162float(src[col]) * score);
+            dst[col] = src[col];
     }
 }
 

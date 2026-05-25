@@ -12,7 +12,6 @@ __global__ void check_combine_scatter_output_kernel(
     const __nv_bfloat16* __restrict__ d_ref,
     const int* __restrict__ gather_index,
     const int* __restrict__ row_to_topk,
-    const float* __restrict__ topk_scores,
     const uint64_t* __restrict__ combine_buffer_ptrs,
     uint32_t m,
     uint32_t n,
@@ -55,11 +54,7 @@ __global__ void check_combine_scatter_output_kernel(
         const uint64_t actual_offset =
             (static_cast<uint64_t>(local_token) * top_k + static_cast<uint32_t>(topk_i)) * n + col;
 
-        const float score = __ldg(topk_scores +
-                                  static_cast<uint64_t>(src_token) * top_k +
-                                  static_cast<uint32_t>(topk_i));
-        const float ref = __bfloat162float(
-            __float2bfloat16_rn(__bfloat162float(d_ref[idx]) * score));
+        const float ref = __bfloat162float(d_ref[idx]);
         const float actual = __bfloat162float(peer_base[actual_offset]);
         float diff = fabsf(ref - actual);
         const bool mismatch = not (diff <= atol);

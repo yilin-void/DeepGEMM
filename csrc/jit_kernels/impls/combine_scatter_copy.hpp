@@ -14,7 +14,7 @@ namespace deep_gemm {
 class CombineScatterCopyRowsRuntime final: public LaunchRuntime<CombineScatterCopyRowsRuntime> {
 public:
     struct Args {
-        void *d_ref, *gather_index, *row_to_topk, *topk_scores, *combine_buffer_ptrs;
+        void *d_ref, *gather_index, *row_to_topk, *combine_buffer_ptrs;
         uint32_t m, n, tokens_per_rank, top_k, num_ranks;
         uint32_t rows_per_block;
         LaunchArgs launch_args;
@@ -34,7 +34,7 @@ static void __instantiate_kernel() {{
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.d_ref, args.gather_index, args.row_to_topk, args.topk_scores, args.combine_buffer_ptrs,
+            args.d_ref, args.gather_index, args.row_to_topk, args.combine_buffer_ptrs,
             args.m, args.n, args.tokens_per_rank, args.top_k, args.num_ranks));
     }
 };
@@ -42,7 +42,6 @@ static void __instantiate_kernel() {{
 static void combine_scatter_copy_rows(const torch::Tensor& d_ref,
                                       const torch::Tensor& gather_index,
                                       const torch::Tensor& row_to_topk,
-                                      const torch::Tensor& topk_scores,
                                       const torch::Tensor& combine_buffer_ptrs,
                                       const int& tokens_per_rank,
                                       const int& top_k,
@@ -52,12 +51,9 @@ static void combine_scatter_copy_rows(const torch::Tensor& d_ref,
     DG_HOST_ASSERT(d_ref.dim() == 2);
     DG_HOST_ASSERT(gather_index.is_cuda() and gather_index.is_contiguous());
     DG_HOST_ASSERT(row_to_topk.is_cuda() and row_to_topk.is_contiguous());
-    DG_HOST_ASSERT(topk_scores.is_cuda() and topk_scores.is_contiguous());
     DG_HOST_ASSERT(combine_buffer_ptrs.is_cuda() and combine_buffer_ptrs.is_contiguous());
     DG_HOST_ASSERT(gather_index.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(row_to_topk.scalar_type() == torch::kInt);
-    DG_HOST_ASSERT(topk_scores.scalar_type() == torch::kFloat);
-    DG_HOST_ASSERT(topk_scores.dim() == 2);
     DG_HOST_ASSERT(combine_buffer_ptrs.scalar_type() == torch::kLong);
     DG_HOST_ASSERT(tokens_per_rank > 0);
     DG_HOST_ASSERT(top_k > 0);
@@ -72,8 +68,6 @@ static void combine_scatter_copy_rows(const torch::Tensor& d_ref,
     DG_HOST_ASSERT(gather_index.numel() >= m64);
     DG_HOST_ASSERT(row_to_topk.numel() >= m64);
     DG_HOST_ASSERT(combine_buffer_ptrs.numel() > 0 and combine_buffer_ptrs.numel() <= 8);
-    DG_HOST_ASSERT(topk_scores.size(0) >= static_cast<int64_t>(tokens_per_rank) * combine_buffer_ptrs.numel());
-    DG_HOST_ASSERT(topk_scores.size(1) >= top_k);
 
     constexpr int num_threads = 256;
     const int num_blocks = static_cast<int>(ceil_div<uint64_t>(static_cast<uint64_t>(m64),
@@ -82,7 +76,6 @@ static void combine_scatter_copy_rows(const torch::Tensor& d_ref,
         .d_ref = d_ref.data_ptr(),
         .gather_index = gather_index.data_ptr(),
         .row_to_topk = row_to_topk.data_ptr(),
-        .topk_scores = topk_scores.data_ptr(),
         .combine_buffer_ptrs = combine_buffer_ptrs.data_ptr(),
         .m = static_cast<uint32_t>(m64),
         .n = static_cast<uint32_t>(n64),
