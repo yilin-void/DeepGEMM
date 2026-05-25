@@ -255,6 +255,16 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         quant_config.is_fp4_b, use_ue8m0=False, use_block_cast_for_fp8=True)
 
     d = torch.empty((m_logical, n_eff), dtype=torch.bfloat16, device='cuda')
+    peer_tma_ptr_override = None
+    peer_tma_dst_rank = None
+    if args.bench_peer_tma_store or args.bench_peer_stg_store:
+        peer_tma_d_local = torch.empty_like(d)
+        peer_tma_handles = [None] * num_ranks
+        dist.all_gather_object(peer_tma_handles, deep_gemm.cuda_ipc_get_mem_handle(peer_tma_d_local), group=group)
+        peer_tma_ptrs = deep_gemm.cuda_ipc_open_mem_handles(peer_tma_handles, rank, peer_tma_d_local)
+        peer_tma_dst_rank = (rank + 1) % num_ranks
+        peer_tma_ptr_override = int(peer_tma_ptrs[peer_tma_dst_rank])
+
     torch.manual_seed(0x3456)
     combine_topk_scores = torch.rand((total_tokens, combine_top_k), dtype=torch.float32, device='cuda')
     local_topk_scores = combine_topk_scores[
@@ -278,7 +288,9 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     compute_stream = torch.cuda.Stream()
     comm_stream = torch.cuda.Stream()
 
-    def launch_gemm(enable_combine_scatter: bool) -> None:
+    def launch_gemm(enable_combine_scatter: bool,
+                    use_tma_store: bool = True,
+                    tma_store_ptr_override: int | None = None) -> None:
         kw = {}
         if enable_combine_scatter:
             kw.update(combine_src_index=combine_src_index,
@@ -293,6 +305,8 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             use_psum_layout=True,
             expected_m_for_psum_layout=expected_m_per_expert,
             gather_index=gemm_gather_index,
+            use_tma_store=False if enable_combine_scatter else use_tma_store,
+            tma_store_ptr_override=tma_store_ptr_override,
             **kw,
         )
 
@@ -304,6 +318,20 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     def run_fused_scatter() -> None:
         with torch.cuda.stream(compute_stream):
             launch_gemm(enable_combine_scatter=True)
+        torch.cuda.current_stream().wait_stream(compute_stream)
+
+    def run_peer_tma_store() -> None:
+        with torch.cuda.stream(compute_stream):
+            launch_gemm(enable_combine_scatter=False,
+                        use_tma_store=True,
+                        tma_store_ptr_override=peer_tma_ptr_override)
+        torch.cuda.current_stream().wait_stream(compute_stream)
+
+    def run_peer_stg_store() -> None:
+        with torch.cuda.stream(compute_stream):
+            launch_gemm(enable_combine_scatter=False,
+                        use_tma_store=False,
+                        tma_store_ptr_override=peer_tma_ptr_override)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
     def run_standalone_scatter() -> None:
@@ -491,6 +519,25 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         _bench_cuda_event_ms(run_fused_scatter, group, compute_stream,
                              warmups=args.warmups, iters=args.iters), group)
 
+    peer_tma_store_ms = None
+    peer_tma_store_event_ms = None
+    if args.bench_peer_tma_store:
+        _rank0_print(rank, 'Benchmarking row-major peer TMA store GEMM...')
+        peer_tma_store_ms = _max_across_ranks(
+            _bench_ms(run_peer_tma_store, group, warmups=args.warmups, iters=args.iters), group)
+        peer_tma_store_event_ms = _max_across_ranks(
+            _bench_cuda_event_ms(run_peer_tma_store, group, compute_stream,
+                                 warmups=args.warmups, iters=args.iters), group)
+    peer_stg_store_ms = None
+    peer_stg_store_event_ms = None
+    if args.bench_peer_stg_store:
+        _rank0_print(rank, 'Benchmarking row-major peer STG store GEMM...')
+        peer_stg_store_ms = _max_across_ranks(
+            _bench_ms(run_peer_stg_store, group, warmups=args.warmups, iters=args.iters), group)
+        peer_stg_store_event_ms = _max_across_ranks(
+            _bench_cuda_event_ms(run_peer_stg_store, group, compute_stream,
+                                 warmups=args.warmups, iters=args.iters), group)
+
     standalone_scatter_ms = None
     standalone_scatter_event_ms = None
     two_stage_scatter_ms = None
@@ -568,6 +615,16 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         print('  fused scatter scheme:', flush=True)
         print(f'    fused GEMM+scatter    : {fused_scatter_ms * 1e3:8.2f} us '
               f'(event {fused_scatter_event_ms * 1e3:8.2f} us)', flush=True)
+        if peer_tma_store_ms is not None:
+            print('  row-major peer TMA experiment:', flush=True)
+            print(f'    peer dst rank offset  : {(peer_tma_dst_rank - rank) % num_ranks}', flush=True)
+            print(f'    GEMM peer TMA store   : {peer_tma_store_ms * 1e3:8.2f} us '
+                  f'(event {peer_tma_store_event_ms * 1e3:8.2f} us)', flush=True)
+        if peer_stg_store_ms is not None:
+            print('  row-major peer STG experiment:', flush=True)
+            print(f'    peer dst rank offset  : {(peer_tma_dst_rank - rank) % num_ranks}', flush=True)
+            print(f'    GEMM peer STG store   : {peer_stg_store_ms * 1e3:8.2f} us '
+                  f'(event {peer_stg_store_event_ms * 1e3:8.2f} us)', flush=True)
         if standalone_scatter_ms is not None:
             scatter_bytes = tokens_per_rank * combine_top_k * n_eff * d.element_size()
             scatter_bw = scatter_bytes / (standalone_scatter_event_ms / 1e3) / 1e9
@@ -616,6 +673,10 @@ def main() -> None:
                         help='Use pre-gathered contiguous A/SFA rows while keeping combine_src_index for scatter')
     parser.add_argument('--bench-standalone-scatter', action='store_true',
                         help='Benchmark separate D -> peer combine-buffer scatter-copy and two-stage total')
+    parser.add_argument('--bench-peer-tma-store', action='store_true',
+                        help='Benchmark a row-major no-scatter GEMM whose TMA epilogue writes D to a peer rank')
+    parser.add_argument('--bench-peer-stg-store', action='store_true',
+                        help='Benchmark a row-major no-scatter GEMM whose STG epilogue writes D to a peer rank')
     parser.add_argument('--bench-reduce-scatter', action='store_true',
                         help='Benchmark GEMM + local pack/reduce + NCCL reduce-scatter baseline')
     parser.add_argument('--scatter-rows-per-block', type=int, default=4,

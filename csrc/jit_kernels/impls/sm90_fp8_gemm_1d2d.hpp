@@ -46,6 +46,9 @@ public:
         void *combine_buffer_ptrs;   // (num_ranks,) int64/uint64 device pointer table
         uint32_t combine_tokens_per_rank;
         uint32_t combine_top_k;
+        void *gmem_d;
+        uint32_t stride_d;
+        bool use_tma_store;
         // TMA descriptors kept for reference (A/sfa currently unused in kernel)
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
@@ -71,6 +74,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {}, {},
         {},
+        {},
         {}
     >);
 }};
@@ -89,6 +93,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
         args.gather_index != nullptr,
         args.combine_row_topk != nullptr,
+        args.use_tma_store,
         get_default_epilogue_type(args.epilogue_type));
     }
 
@@ -103,6 +108,7 @@ static void __instantiate_kernel() {{
             args.rank_flags, args.tile_rank, args.num_ranks, args.rank_flag_epoch,
             args.combine_row_topk, args.combine_buffer_ptrs,
             args.combine_tokens_per_rank, args.combine_top_k,
+            args.gmem_d, args.stride_d,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_d, args.tensor_map_sfa));
     }
@@ -229,6 +235,9 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .combine_buffer_ptrs = nullptr,
         .combine_tokens_per_rank = 0u,
         .combine_top_k = 0u,
+        .gmem_d = d.data_ptr(),
+        .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -259,7 +268,9 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const std::optional<torch::Tensor>& combine_row_topk = std::nullopt,
                                                     const std::optional<torch::Tensor>& combine_buffer_ptrs = std::nullopt,
                                                     const std::optional<int>& combine_tokens_per_rank = std::nullopt,
-                                                    const std::optional<int>& combine_top_k = std::nullopt) {
+                                                    const std::optional<int>& combine_top_k = std::nullopt,
+                                                    const bool& use_tma_store = true,
+                                                    const std::optional<int64_t>& tma_store_ptr_override = std::nullopt) {
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
     if (gather_index.has_value()) {
@@ -290,6 +301,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     // output slots. It uses combine_src_index to recover the source token; for
     // old gather-A callers, gather_index is accepted as the same source map.
     const bool has_combine_scatter = combine_row_topk.has_value();
+    DG_HOST_ASSERT(not (has_combine_scatter and use_tma_store));
     const auto& effective_combine_src_index = combine_src_index.has_value() ? combine_src_index : gather_index;
     if (has_combine_scatter) {
         DG_HOST_ASSERT(effective_combine_src_index.has_value() and
@@ -358,11 +370,15 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                               config.layout.block_k,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
                                               config.storage_config.swizzle_b_mode);
-    const auto tensor_map_d = make_tma_cd_desc(d, m, n,
-                                               config.storage_config.store_block_m,
-                                               config.storage_config.store_block_n,
-                                               static_cast<int>(d.stride(-2)), 1,
-                                               config.storage_config.swizzle_cd_mode);
+    void* tensor_map_d_base = tma_store_ptr_override.has_value()
+        ? reinterpret_cast<void*>(static_cast<uintptr_t>(tma_store_ptr_override.value()))
+        : d.data_ptr();
+    const auto tensor_map_d = make_tma_cd_desc_from_ptr(tensor_map_d_base, d.scalar_type(),
+                                                        static_cast<int>(d.element_size()), m, n,
+                                                        config.storage_config.store_block_m,
+                                                        config.storage_config.store_block_n,
+                                                        static_cast<int>(d.stride(-2)), 1,
+                                                        config.storage_config.swizzle_cd_mode);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, config.layout.block_k, 1, 0);
     const int combine_scatter_smem_size = has_combine_scatter ?
@@ -395,6 +411,9 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .combine_buffer_ptrs = has_combine_scatter ? combine_buffer_ptrs->data_ptr() : nullptr,
         .combine_tokens_per_rank = has_combine_scatter ? static_cast<uint32_t>(combine_tokens_per_rank.value()) : 0u,
         .combine_top_k = has_combine_scatter ? static_cast<uint32_t>(combine_top_k.value()) : 0u,
+        .gmem_d = tensor_map_d_base,
+        .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .use_tma_store = use_tma_store,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -479,6 +498,9 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .combine_buffer_ptrs = nullptr,
         .combine_tokens_per_rank = 0u,
         .combine_top_k = 0u,
+        .gmem_d = d.data_ptr(),
+        .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -569,6 +591,9 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .combine_buffer_ptrs = nullptr,
         .combine_tokens_per_rank = 0u,
         .combine_top_k = 0u,
+        .gmem_d = d.data_ptr(),
+        .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
