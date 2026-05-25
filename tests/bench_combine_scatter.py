@@ -110,6 +110,79 @@ def _max_across_ranks(value: float, group: dist.ProcessGroup) -> float:
     return float(t.item())
 
 
+def _build_cpu_combine_reference(d_ref: torch.Tensor,
+                                 gather_index: torch.Tensor,
+                                 row_to_topk: torch.Tensor,
+                                 topk_scores: torch.Tensor,
+                                 tokens_per_rank: int,
+                                 top_k: int,
+                                 num_ranks: int,
+                                 ref_tokens: int,
+                                 group: dist.ProcessGroup) -> torch.Tensor:
+    d_cpu = d_ref.detach().cpu()
+    gather_cpu = gather_index.detach().cpu().to(torch.int64)
+    row_topk_cpu = row_to_topk.detach().cpu().to(torch.int64)
+    scores_cpu = topk_scores.detach().cpu()
+
+    n = int(d_cpu.size(1))
+    partial = torch.zeros((num_ranks, ref_tokens, n), dtype=torch.float32, device='cpu')
+
+    valid = (gather_cpu >= 0) & (row_topk_cpu >= 0) & (row_topk_cpu < top_k)
+    valid &= gather_cpu < tokens_per_rank * num_ranks
+    src_tokens = gather_cpu[valid]
+    rows = torch.nonzero(valid, as_tuple=False).flatten()
+    src_ranks = torch.div(src_tokens, tokens_per_rank, rounding_mode='floor')
+    local_tokens = src_tokens - src_ranks * tokens_per_rank
+    in_sample = local_tokens < ref_tokens
+
+    rows = rows[in_sample]
+    src_tokens = src_tokens[in_sample]
+    src_ranks = src_ranks[in_sample]
+    local_tokens = local_tokens[in_sample]
+    topk_slots = row_topk_cpu[valid][in_sample]
+
+    for row, src_token, src_rank, local_token, topk_slot in zip(
+            rows.tolist(), src_tokens.tolist(), src_ranks.tolist(),
+            local_tokens.tolist(), topk_slots.tolist()):
+        score = float(scores_cpu[src_token, topk_slot])
+        partial[src_rank, local_token].add_(d_cpu[row].float(), alpha=score)
+
+    partial_gpu = partial.cuda()
+    dist.all_reduce(partial_gpu, op=dist.ReduceOp.SUM, group=group)
+    return partial_gpu[dist.get_rank(group)].contiguous()
+
+
+def _check_against_reference(label: str,
+                             actual: torch.Tensor,
+                             reference: torch.Tensor,
+                             group: dist.ProcessGroup,
+                             rtol: float,
+                             atol: float) -> tuple[float, int]:
+    actual = actual[:reference.size(0), :].contiguous()
+    diff = (actual - reference).abs()
+    tolerance = atol + rtol * reference.abs()
+    nonfinite = ~torch.isfinite(diff)
+    finite_diff = torch.nan_to_num(diff, nan=float('inf'), posinf=float('inf'), neginf=float('inf'))
+    max_diff_t = finite_diff.max().reshape(1)
+    mismatch_count_t = (nonfinite | (finite_diff > tolerance)).sum().reshape(1)
+    actual_nonfinite_t = (~torch.isfinite(actual)).sum().reshape(1)
+    ref_nonfinite_t = (~torch.isfinite(reference)).sum().reshape(1)
+    dist.all_reduce(max_diff_t, op=dist.ReduceOp.MAX, group=group)
+    dist.all_reduce(mismatch_count_t, op=dist.ReduceOp.SUM, group=group)
+    dist.all_reduce(actual_nonfinite_t, op=dist.ReduceOp.SUM, group=group)
+    dist.all_reduce(ref_nonfinite_t, op=dist.ReduceOp.SUM, group=group)
+    max_diff = float(max_diff_t.item())
+    mismatch_count = int(mismatch_count_t.item())
+    actual_nonfinite = int(actual_nonfinite_t.item())
+    ref_nonfinite = int(ref_nonfinite_t.item())
+    if mismatch_count != 0:
+        raise AssertionError(
+            f'{label} mismatch vs CPU reference: count={mismatch_count}, '
+            f'max_abs_diff={max_diff}, actual_nonfinite={actual_nonfinite}, '
+            f'ref_nonfinite={ref_nonfinite}, rtol={rtol}, atol={atol}')
+    return max_diff, mismatch_count
+
+
 def _init_nccl_cpp_comm(rank: int, num_ranks: int, local_rank: int,
                         group: dist.ProcessGroup):
     nccl_unique_ids = [deep_gemm.nccl_get_unique_id() if rank == 0 else None]
@@ -306,6 +379,38 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         if args.bench_standalone_scatter:
             check_scatter_output('Standalone scatter-copy', run_standalone_scatter)
 
+        cpu_ref_tokens = tokens_per_rank if args.cpu_ref_tokens < 0 else min(args.cpu_ref_tokens, tokens_per_rank)
+        cpu_reference = None
+        if cpu_ref_tokens > 0:
+            _rank0_print(rank, f'Building CPU combine reference for first {cpu_ref_tokens} local tokens...')
+            run_gemm_no_scatter()
+            torch.cuda.synchronize()
+            dist.barrier(group=group)
+            cpu_reference = _build_cpu_combine_reference(
+                d, gather_index, row_to_topk, combine_topk_scores,
+                tokens_per_rank, combine_top_k, num_ranks, cpu_ref_tokens, group)
+            torch.cuda.synchronize()
+            dist.barrier(group=group)
+
+        if cpu_reference is not None:
+            _rank0_print(rank, 'Checking fused scatter + local reduction against CPU reference...')
+            run_fused_scatter()
+            torch.cuda.synchronize()
+            dist.barrier(group=group)
+            combine_nonfinite_count_t = (~torch.isfinite(combine_buffer)).sum().reshape(1)
+            dist.all_reduce(combine_nonfinite_count_t, op=dist.ReduceOp.SUM, group=group)
+            combine_nonfinite_count = int(combine_nonfinite_count_t.item())
+            if combine_nonfinite_count != 0:
+                raise AssertionError(f'Fused combine buffer has non-finite values: count={combine_nonfinite_count}')
+            run_local_reduce_only()
+            torch.cuda.synchronize()
+            dist.barrier(group=group)
+            max_diff, _ = _check_against_reference(
+                'Fused scatter + local reduction', fused_reduce_output, cpu_reference, group,
+                args.reduce_check_rtol, args.reduce_check_atol)
+            _rank0_print(rank, f'CPU reference check passed for fused scatter + local reduction: '
+                         f'max_abs_diff={max_diff:.6g}, tokens={cpu_ref_tokens}, mismatches=0')
+
         if args.bench_reduce_scatter:
             _rank0_print(rank, 'Checking reduce-scatter baseline against fused scatter + local reduction...')
             run_reduce_scatter_baseline()
@@ -350,6 +455,12 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                     f'rtol={args.reduce_check_rtol}, atol={args.reduce_check_atol}')
             _rank0_print(rank, f'Reduce-scatter baseline check passed: max_abs_diff={max_diff:.6g}, '
                          f'mismatches=0')
+            if cpu_reference is not None:
+                max_diff, _ = _check_against_reference(
+                    'Reduce-scatter baseline', reduce_scatter_output, cpu_reference, group,
+                    args.reduce_check_rtol, args.reduce_check_atol)
+                _rank0_print(rank, f'CPU reference check passed for reduce-scatter baseline: '
+                             f'max_abs_diff={max_diff:.6g}, tokens={cpu_ref_tokens}, mismatches=0')
 
     _rank0_print(rank, 'Benchmarking GEMM without combine-scatter...')
     gemm_no_scatter_ms = _max_across_ranks(
@@ -496,6 +607,9 @@ def main() -> None:
                         help='Relative tolerance for fused scatter+local-reduce vs reduce-scatter baseline')
     parser.add_argument('--reduce-check-atol', type=float, default=2e-2,
                         help='Absolute tolerance for fused scatter+local-reduce vs reduce-scatter baseline')
+    parser.add_argument('--cpu-ref-tokens', type=int, default=32,
+                        help='When --check is set, compare against a CPU arithmetic reference for this many '
+                             'local tokens per rank. Use -1 for all local tokens, or 0 to disable.')
     parser.add_argument('--num-weights', type=int, default=1,
                         help='Number of weight matrices per expert (e.g. 2 for fused gate+up)')
     parser.add_argument('--block-m', type=int, default=128)
@@ -503,6 +617,8 @@ def main() -> None:
     parser.add_argument('--iters', type=int, default=10)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
+    if args.cpu_ref_tokens < -1:
+        raise ValueError('--cpu-ref-tokens must be -1, 0, or a positive integer')
 
     if args.bench_reduce_scatter:
         _set_default_nccl_ctas()

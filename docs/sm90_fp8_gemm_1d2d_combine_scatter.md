@@ -380,6 +380,23 @@ benchmark 在 reduce-scatter correctness 路径里还会额外检查 owner rank 
 `combine_buffer` 是否全为 finite。这个检查覆盖了 writer-side IPC mapping checker
 无法单独发现的 IPC offset / owner-read 问题。
 
+此外，`--check` 默认会为每个 rank 的前 32 个 local tokens 构造 CPU arithmetic
+reference。每个 rank 在 CPU 上用普通 GEMM 输出 `D`、`gather_index`、
+`row_to_topk` 和 `topk_scores` 计算：
+
+```text
+partial[dst_rank, local_token, col] += bf16(D[row, col]) * topk_scores[src_token, topk_slot]
+```
+
+随后把 partial 搬回 GPU 做一次跨 rank `all_reduce(SUM)`，得到每个 source rank 的
+CPU reference output，并分别校验：
+
+- fused scatter + local reduction
+- GEMM + pack/local-reduce + NCCL reduce-scatter baseline
+
+`--cpu-ref-tokens` 控制 CPU reference 覆盖的 local token 数：默认 32，`-1` 表示全量，
+`0` 表示关闭。
+
 ### 5.2 standalone scatter-copy baseline
 
 `combine_scatter_copy_rows` 是 two-stage baseline 的第 2 段：
@@ -485,7 +502,8 @@ python3 tests/bench_combine_scatter.py \
   --bench-reduce-scatter \
   --warmups 3 \
   --iters 5 \
-  --check
+  --check \
+  --cpu-ref-tokens 32
 ```
 
 log：
