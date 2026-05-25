@@ -111,7 +111,7 @@ def _max_across_ranks(value: float, group: dist.ProcessGroup) -> float:
 
 
 def _build_cpu_combine_reference(d_ref: torch.Tensor,
-                                 gather_index: torch.Tensor,
+                                 combine_src_index: torch.Tensor,
                                  row_to_topk: torch.Tensor,
                                  topk_scores: torch.Tensor,
                                  tokens_per_rank: int,
@@ -120,7 +120,7 @@ def _build_cpu_combine_reference(d_ref: torch.Tensor,
                                  ref_tokens: int,
                                  group: dist.ProcessGroup) -> torch.Tensor:
     d_cpu = d_ref.detach().cpu()
-    gather_cpu = gather_index.detach().cpu().to(torch.int64)
+    gather_cpu = combine_src_index.detach().cpu().to(torch.int64)
     row_topk_cpu = row_to_topk.detach().cpu().to(torch.int64)
     scores_cpu = topk_scores.detach().cpu()
 
@@ -218,9 +218,6 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
 
     torch.manual_seed(0x2026)
     a_global_bf16 = torch.randn((total_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    a_pool, sfa_global = cast_fp8_fp4_with_major(
-        a_global_bf16, MajorTypeAB.KMajor, quant_config.gran_k_a,
-        quant_config.is_fp4_a, use_ue8m0=False)
 
     _rank0_print(rank, 'Building gather layout...')
     routing_topk = _generate_distinct_routing_topk(total_tokens, local_top_k, num_experts, seed=0xBEEF)
@@ -231,6 +228,23 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     m_logical = int(m_logical_t.item())
     expected_m_per_expert = int((m_logical + num_experts - 1) // num_experts * 1.2)
     _rank0_print(rank, f'Gather layout ready: m_logical={m_logical}')
+    combine_src_index = gather_index
+
+    if args.no_gather_a:
+        _rank0_print(rank, 'Preparing pre-gathered A rows for GEMM2-style no-gather load...')
+        gather_used = gather_index[:m_logical].to(torch.int64)
+        valid_rows = gather_used >= 0
+        a_grouped_bf16 = torch.zeros((m_logical, hidden), dtype=torch.bfloat16, device='cuda')
+        a_grouped_bf16[valid_rows] = a_global_bf16[gather_used[valid_rows]]
+        a_pool, sfa_global = cast_fp8_fp4_with_major(
+            a_grouped_bf16, MajorTypeAB.KMajor, quant_config.gran_k_a,
+            quant_config.is_fp4_a, use_ue8m0=False)
+        gemm_gather_index = None
+    else:
+        a_pool, sfa_global = cast_fp8_fp4_with_major(
+            a_global_bf16, MajorTypeAB.KMajor, quant_config.gran_k_a,
+            quant_config.is_fp4_a, use_ue8m0=False)
+        gemm_gather_index = gather_index
 
     _rank0_print(rank, 'Preparing grouped GEMM weights...')
     n_eff = args.n * args.num_weights
@@ -267,7 +281,8 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     def launch_gemm(enable_combine_scatter: bool) -> None:
         kw = {}
         if enable_combine_scatter:
-            kw.update(combine_row_topk=row_to_topk,
+            kw.update(combine_src_index=combine_src_index,
+                      combine_row_topk=row_to_topk,
                       combine_buffer_ptrs=combine_buffer_ptrs_t,
                       combine_tokens_per_rank=tokens_per_rank,
                       combine_top_k=combine_top_k)
@@ -277,7 +292,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             disable_ue8m0_cast=True,
             use_psum_layout=True,
             expected_m_for_psum_layout=expected_m_per_expert,
-            gather_index=gather_index,
+            gather_index=gemm_gather_index,
             **kw,
         )
 
@@ -294,7 +309,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     def run_standalone_scatter() -> None:
         with torch.cuda.stream(compute_stream):
             deep_gemm.combine_scatter_copy_rows(
-                d, gather_index, row_to_topk, combine_buffer_ptrs_t,
+                d, combine_src_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, args.scatter_rows_per_block)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
@@ -302,7 +317,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         with torch.cuda.stream(compute_stream):
             launch_gemm(enable_combine_scatter=False)
             deep_gemm.combine_scatter_copy_rows(
-                d, gather_index, row_to_topk, combine_buffer_ptrs_t,
+                d, combine_src_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, args.scatter_rows_per_block)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
@@ -310,7 +325,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         with torch.cuda.stream(compute_stream):
             reduce_scatter_input.zero_()
             deep_gemm.combine_pack_for_reduce_scatter(
-                d, gather_index, row_to_topk, combine_topk_scores, reduce_scatter_input,
+                d, combine_src_index, row_to_topk, combine_topk_scores, reduce_scatter_input,
                 tokens_per_rank, combine_top_k)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
@@ -324,7 +339,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             launch_gemm(enable_combine_scatter=False)
             reduce_scatter_input.zero_()
             deep_gemm.combine_pack_for_reduce_scatter(
-                d, gather_index, row_to_topk, combine_topk_scores, reduce_scatter_input,
+                d, combine_src_index, row_to_topk, combine_topk_scores, reduce_scatter_input,
                 tokens_per_rank, combine_top_k)
         with torch.cuda.stream(comm_stream):
             comm_stream.wait_stream(compute_stream)
@@ -363,7 +378,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             torch.cuda.synchronize()
             dist.barrier(group=group)
             max_diff_t, mismatch_count_t = deep_gemm.check_combine_scatter_output(
-                d, gather_index, row_to_topk, combine_buffer_ptrs_t,
+                d, combine_src_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, 0.0)
             torch.cuda.synchronize()
             dist.all_reduce(max_diff_t, op=dist.ReduceOp.MAX, group=group)
@@ -387,7 +402,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             torch.cuda.synchronize()
             dist.barrier(group=group)
             cpu_reference = _build_cpu_combine_reference(
-                d, gather_index, row_to_topk, combine_topk_scores,
+                d, combine_src_index, row_to_topk, combine_topk_scores,
                 tokens_per_rank, combine_top_k, num_ranks, cpu_ref_tokens, group)
             torch.cuda.synchronize()
             dist.barrier(group=group)
@@ -544,6 +559,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         print(f'  global_experts={args.global_num_experts}, local_experts={num_experts}, '
               f'global_top_k={combine_top_k}, local_top_k={local_top_k}', flush=True)
         print(f'  m_logical={m_logical}, n={args.n}, num_weights={args.num_weights}, n_eff={n_eff}', flush=True)
+        print(f'  gather_a={not args.no_gather_a}', flush=True)
         if args.bench_reduce_scatter:
             print(f'  nccl_ctas={os.environ["NCCL_MIN_CTAS"]}/{os.environ["NCCL_MAX_CTAS"]}', flush=True)
         print('  common components:', flush=True)
@@ -596,6 +612,8 @@ def main() -> None:
     parser.add_argument('--global-num-experts', type=int, default=512)
     parser.add_argument('--experts-per-rank-token', type=int, default=2,
                         help='Number of local experts selected per token on each EP rank')
+    parser.add_argument('--no-gather-a', action='store_true',
+                        help='Use pre-gathered contiguous A/SFA rows while keeping combine_src_index for scatter')
     parser.add_argument('--bench-standalone-scatter', action='store_true',
                         help='Benchmark separate D -> peer combine-buffer scatter-copy and two-stage total')
     parser.add_argument('--bench-reduce-scatter', action='store_true',
