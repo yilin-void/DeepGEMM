@@ -148,6 +148,30 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
     return tensor_map;
 }
 
+static CUtensorMap make_tma_2d_desc_from_ptr(void* data_ptr,
+                                             const at::ScalarType& scalar_type,
+                                             const int& elem_size,
+                                             int gmem_inner_dim, int gmem_outer_dim,
+                                             int smem_inner_dim, int smem_outer_dim,
+                                             const int& gmem_outer_stride,
+                                             const int& swizzle_mode, const int& swizzle_base = 0,
+                                             const bool& allow_tf32 = false) {
+    if (swizzle_mode != 0)
+        smem_inner_dim = swizzle_mode / elem_size;
+
+    CUtensorMap tensor_map;
+    const cuuint64_t gmem_dims[2] = {static_cast<cuuint64_t>(gmem_inner_dim), static_cast<cuuint64_t>(gmem_outer_dim)};
+    const cuuint32_t smem_dims[2] = {static_cast<cuuint32_t>(smem_inner_dim), static_cast<cuuint32_t>(smem_outer_dim)};
+    const cuuint64_t gmem_strides[1] = {static_cast<cuuint64_t>(gmem_outer_stride * elem_size), };
+    const cuuint32_t elem_strides[2] = {1, 1};
+    DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
+        &tensor_map, aten_dtype_to_tensor_map_dtype(scalar_type, allow_tf32, true),
+        2, data_ptr, gmem_dims, gmem_strides, smem_dims, elem_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return tensor_map;
+}
+
 static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
                                     int gmem_dim_0, int gmem_dim_1, int gmem_dim_2,
                                     int smem_dim_0, int smem_dim_1, int smem_dim_2,
@@ -241,6 +265,23 @@ static CUtensorMap make_tma_cd_desc(const torch::Tensor& t,
                             outer_stride,
                             swizzle_mode, swizzle_base,
                             allow_tf32);
+}
+
+static CUtensorMap make_tma_cd_desc_from_ptr(void* data_ptr,
+                                             const at::ScalarType& scalar_type,
+                                             const int& elem_size,
+                                             const int& shape_m, const int& shape_n,
+                                             const int& block_m, const int& block_n,
+                                             const int& outer_stride,
+                                             const int& num_groups,
+                                             const int& swizzle_mode, const int& swizzle_base = 0,
+                                             const bool& allow_tf32 = false) {
+    return make_tma_2d_desc_from_ptr(data_ptr, scalar_type, elem_size,
+                                     shape_n, shape_m * num_groups,
+                                     block_n, block_m,
+                                     outer_stride,
+                                     swizzle_mode, swizzle_base,
+                                     allow_tf32);
 }
 
 static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,

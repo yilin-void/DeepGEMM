@@ -160,6 +160,7 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumSMs, GemmType kGemmType,
           bool kSFAIsMNMajor, bool kHasGatherIndex, bool kHasRankFlags,
           bool kCombineScatter,
+          bool kUseTMAStore,
           typename epilogue_type_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
@@ -191,6 +192,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const uint64_t* __restrict__ combine_buffer_ptrs,
                         uint32_t combine_tokens_per_rank,
                         uint32_t combine_top_k,
+                        nv_bfloat16* __restrict__ gmem_d,
+                        uint32_t stride_d,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_d,
@@ -891,8 +894,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             }
 
             // Wait last TMA store to be finished
-            if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N)
-                cute::tma_store_wait<0>();
+            if constexpr (kUseTMAStore) {
+                if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N)
+                    cute::tma_store_wait<0>();
+            }
             cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 1);
 
             // Write back to shared memory using STSM and issue TMA stores
@@ -905,7 +910,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
                     // Swizzle or padding into the correct address
                     uint8_t* smem_ptr = nullptr;
-                    if constexpr (kSwizzleDMode > 0) {
+                    if constexpr (not kUseTMAStore) {
+                        smem_ptr = reinterpret_cast<uint8_t*>(
+                            smem_d + (m_offset + warp_idx * WGMMA_M_PER_WARP + lane_idx) * BLOCK_N + i * 8);
+                    } else if constexpr (kSwizzleDMode > 0) {
                         // Calculate the swizzling atom offset and in-atom offset
                         constexpr uint32_t kNumBankGroupBytes = 16;
                         auto atom_offset = i / (TMA_D_BLOCK_N / 8), in_atom_offset = i % (TMA_D_BLOCK_N / 8);
@@ -941,26 +949,62 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     );
                 }
             }
-            cute::tma_store_fence();
+            if constexpr (kUseTMAStore)
+                cute::tma_store_fence();
             cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 1);
 
-            // Use TMA store to write back to global memory
-            // TODO: compatible with FP32 output
-            DG_STATIC_ASSERT(kNumWGMMAStoreThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
-            if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
-                auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N;
-                auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
-                auto n_idx = epilogue_type_t::apply_index_n<TMA_D_BLOCK_N>(n_block_idx * BLOCK_N + in_block_n_offset);
-                auto m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
-                if constexpr (kGemmType == GemmType::Batched) {
-                    cute::SM90_TMA_STORE_3D::copy(&tensor_map_d, smem_ptr,
-                                                  n_idx, m_idx, scheduler.current_group_idx);
-                } else {
-                    cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_ptr, n_idx, m_idx);
+            if constexpr (kUseTMAStore) {
+                // Use TMA store to write back to global memory
+                // TODO: compatible with FP32 output
+                DG_STATIC_ASSERT(kNumWGMMAStoreThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
+                if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
+                    auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N;
+                    auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
+                    auto n_idx = epilogue_type_t::apply_index_n<TMA_D_BLOCK_N>(n_block_idx * BLOCK_N + in_block_n_offset);
+                    auto m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
+                    if constexpr (kGemmType == GemmType::Batched) {
+                        cute::SM90_TMA_STORE_3D::copy(&tensor_map_d, smem_ptr,
+                                                      n_idx, m_idx, scheduler.current_group_idx);
+                    } else {
+                        cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_ptr, n_idx, m_idx);
+                    }
+                    cute::tma_store_arrive();
                 }
-                cute::tma_store_arrive();
+                __syncwarp();
+            } else {
+                constexpr uint32_t kStoreVecElems = 8;
+                DG_STATIC_ASSERT(BLOCK_N % kStoreVecElems == 0, "Invalid vectorized store shape");
+                constexpr uint32_t kVecsPerRow = BLOCK_N / kStoreVecElems;
+                const uint32_t base_m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
+                for (uint32_t linear = threadIdx.x; linear < BLOCK_M * kVecsPerRow;
+                     linear += kNumWGMMAStoreThreads) {
+                    const uint32_t row = linear / kVecsPerRow;
+                    const uint32_t vec = linear - row * kVecsPerRow;
+                    const uint32_t logical_m = base_m_idx + row;
+                    const uint32_t col = n_block_idx * BLOCK_N + vec * kStoreVecElems;
+                    if (logical_m >= shape_m or col >= shape_n)
+                        continue;
+
+                    const auto* src = smem_d + row * BLOCK_N + vec * kStoreVecElems;
+                    nv_bfloat16* dst = gmem_d + static_cast<uint64_t>(logical_m) * stride_d +
+                                       epilogue_type_t::template apply_index_n<kStoreVecElems>(col);
+                    if (col + kStoreVecElems <= shape_n) {
+                        uint4 packed;
+                        auto* packed_bf16 = reinterpret_cast<nv_bfloat16*>(&packed);
+                        #pragma unroll
+                        for (uint32_t elem = 0; elem < kStoreVecElems; ++elem)
+                            packed_bf16[elem] = src[elem];
+                        *reinterpret_cast<uint4*>(dst) = packed;
+                    } else {
+                        #pragma unroll
+                        for (uint32_t elem = 0; elem < kStoreVecElems; ++elem) {
+                            if (col + elem < shape_n)
+                                dst[elem] = src[elem];
+                        }
+                    }
+                }
+                cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 1);
             }
-            __syncwarp();
         }
     }
 #else
