@@ -10,6 +10,7 @@ namespace deep_gemm {
 template <uint32_t kNumThreads>
 __global__ void combine_reduce_slots_kernel(
     const __nv_bfloat16* __restrict__ combine_buffer,
+    const float* __restrict__ topk_scores,
     float* __restrict__ out,
     uint32_t tokens_per_rank,
     uint32_t top_k,
@@ -25,7 +26,9 @@ __global__ void combine_reduce_slots_kernel(
         for (uint32_t slot = 0; slot < top_k; ++slot) {
             const uint64_t offset =
                 (static_cast<uint64_t>(token) * top_k + slot) * n + col;
-            acc += __bfloat162float(combine_buffer[offset]);
+            const float score = __ldg(topk_scores +
+                                      static_cast<uint64_t>(token) * top_k + slot);
+            acc += __bfloat162float(combine_buffer[offset]) * score;
         }
         out[idx] = acc;
     }
@@ -65,8 +68,7 @@ __global__ void combine_pack_for_reduce_scatter_kernel(
         const float score = __ldg(topk_scores +
                                   static_cast<uint64_t>(src_token) * top_k +
                                   static_cast<uint32_t>(topk_i));
-        const float value = __bfloat162float(
-            __float2bfloat16_rn(__bfloat162float(d_ref[idx]) * score));
+        const float value = __bfloat162float(d_ref[idx]) * score;
         const uint64_t dst_offset =
             (static_cast<uint64_t>(src_rank) * tokens_per_rank + local_token) * n + col;
         atomicAdd(reduce_scatter_input + dst_offset, value);

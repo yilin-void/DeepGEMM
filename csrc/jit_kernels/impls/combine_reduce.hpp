@@ -15,7 +15,7 @@ namespace deep_gemm {
 class CombineReduceSlotsRuntime final: public LaunchRuntime<CombineReduceSlotsRuntime> {
 public:
     struct Args {
-        void *combine_buffer, *out;
+        void *combine_buffer, *topk_scores, *out;
         uint32_t tokens_per_rank, top_k, n;
         LaunchArgs launch_args;
     };
@@ -34,7 +34,8 @@ static void __instantiate_kernel() {{
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.combine_buffer, args.out, args.tokens_per_rank, args.top_k, args.n));
+            args.combine_buffer, args.topk_scores, args.out,
+            args.tokens_per_rank, args.top_k, args.n));
     }
 };
 
@@ -66,12 +67,16 @@ static void __instantiate_kernel() {{
 };
 
 static void combine_reduce_slots(const torch::Tensor& combine_buffer,
+                                 const torch::Tensor& topk_scores,
                                  const torch::Tensor& out) {
     DG_HOST_ASSERT(combine_buffer.is_cuda() and combine_buffer.is_contiguous());
+    DG_HOST_ASSERT(topk_scores.is_cuda() and topk_scores.is_contiguous());
     DG_HOST_ASSERT(out.is_cuda() and out.is_contiguous());
     DG_HOST_ASSERT(combine_buffer.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(topk_scores.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(out.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(combine_buffer.dim() == 3);
+    DG_HOST_ASSERT(topk_scores.dim() == 2);
     DG_HOST_ASSERT(out.dim() == 2);
 
     const auto tokens64 = combine_buffer.size(0);
@@ -80,6 +85,8 @@ static void combine_reduce_slots(const torch::Tensor& combine_buffer,
     DG_HOST_ASSERT(tokens64 >= 0 and tokens64 <= std::numeric_limits<uint32_t>::max());
     DG_HOST_ASSERT(top_k64 > 0 and top_k64 <= std::numeric_limits<uint32_t>::max());
     DG_HOST_ASSERT(n64 > 0 and n64 <= std::numeric_limits<uint32_t>::max());
+    DG_HOST_ASSERT(topk_scores.size(0) >= tokens64);
+    DG_HOST_ASSERT(topk_scores.size(1) >= top_k64);
     DG_HOST_ASSERT(out.size(0) == tokens64 and out.size(1) == n64);
 
     constexpr int num_threads = 256;
@@ -88,6 +95,7 @@ static void combine_reduce_slots(const torch::Tensor& combine_buffer,
     const int num_blocks = std::min<int>(max_blocks, static_cast<int>(ceil_div<uint64_t>(total, num_threads)));
     const auto args = CombineReduceSlotsRuntime::Args{
         .combine_buffer = combine_buffer.data_ptr(),
+        .topk_scores = topk_scores.data_ptr(),
         .out = out.data_ptr(),
         .tokens_per_rank = static_cast<uint32_t>(tokens64),
         .top_k = static_cast<uint32_t>(top_k64),
