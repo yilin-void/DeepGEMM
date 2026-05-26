@@ -459,6 +459,10 @@ combine_buffer[tokens_per_rank, combine_top_k, N]
 out[token, col] = sum_slot combine_buffer[token, slot, col] * topk_scores[token, slot]
 ```
 
+当前实现把 grid 拆成 `(token, N tile)`，并把 `top_k` 和每线程处理列数作为 JIT
+模板参数。这样可以避免原先 per-element 线性索引里的除法/取模，并且每个 token
+的每个 column tile 只把 top-k score 读到 shared memory 一次，再供该 tile 内线程复用。
+
 两条路径在数学上等价，但 reduction 顺序不同，所以 correctness 用 tolerance，而不是
 要求 bit-exact。
 
@@ -538,7 +542,7 @@ python3 tests/bench_combine_scatter.py \
 log：
 
 ```text
-workspace/logs/bench_combine_scatter_gemm2_target_h200.log
+workspace/logs/bench_combine_scatter_reduce_opt_target_h200.log
 ```
 
 ### 6.2 结果
@@ -561,18 +565,18 @@ gather_a = false
 
 | 方案 | 组件 | 时间 |
 | --- | --- | ---: |
-| common | GEMM no scatter | 867.71 us (event 824.72 us) |
-| fused scatter | fused GEMM + raw scatter | 1634.20 us (event 1566.21 us) |
-| two-stage scatter-copy | GEMM no scatter | 867.71 us (event 824.72 us) |
-| two-stage scatter-copy | raw scatter-copy | 1230.10 us (event 1182.38 us, 386.66 GB/s) |
-| two-stage scatter-copy | total GEMM + scatter-copy | 2025.61 us (event 1980.83 us) |
-| reduce-scatter baseline | GEMM no scatter | 867.71 us (event 824.72 us) |
-| reduce-scatter baseline | pack/local-reduce | 1332.01 us (event 1289.18 us) |
-| reduce-scatter baseline | NCCL reduce-scatter SUM | 1201.28 us (event 1157.58 us, alg-bw 345.57 GB/s) |
-| reduce-scatter baseline | total GEMM + pack + RS | 3281.74 us |
-| fused scatter + local reduction | fused GEMM + raw scatter | 1634.20 us (event 1566.21 us) |
-| fused scatter + local reduction | scored local reduction | 422.82 us (event 381.58 us) |
-| fused scatter + local reduction | total fused + local reduction | 2068.58 us |
+| common | GEMM no scatter | 862.22 us (event 850.70 us) |
+| fused scatter | fused GEMM + raw scatter | 1649.21 us (event 1563.26 us) |
+| two-stage scatter-copy | GEMM no scatter | 862.22 us (event 850.70 us) |
+| two-stage scatter-copy | raw scatter-copy | 1227.08 us (event 1184.05 us, 386.12 GB/s) |
+| two-stage scatter-copy | total GEMM + scatter-copy | 2035.26 us (event 1983.41 us) |
+| reduce-scatter baseline | GEMM no scatter | 862.22 us (event 850.70 us) |
+| reduce-scatter baseline | pack/local-reduce | 1341.52 us (event 1299.76 us) |
+| reduce-scatter baseline | NCCL reduce-scatter SUM | 1201.39 us (event 1158.22 us, alg-bw 345.38 GB/s) |
+| reduce-scatter baseline | total GEMM + pack + RS | 3295.54 us |
+| fused scatter + local reduction | fused GEMM + raw scatter | 1649.21 us (event 1563.26 us) |
+| fused scatter + local reduction | scored local reduction | 201.82 us (event 162.29 us) |
+| fused scatter + local reduction | total fused + local reduction | 1849.99 us |
 
 correctness：
 
@@ -606,23 +610,23 @@ tokens_per_rank * top_k * n * sizeof(bf16)
 以 two-stage 为 baseline：
 
 ```text
-two-stage event       ≈ 1981 us
-fused combine-scatter ≈ 1566 us
+two-stage event       ≈ 1983 us
+fused combine-scatter ≈ 1563 us
 ```
 
-fused epilogue 省掉约 `415 us`，约 `1.26x`。这说明 fused 路径确实把独立
+fused epilogue 省掉约 `420 us`，约 `1.27x`。这说明 fused 路径确实把独立
 scatter-copy 的大部分成本藏进了 GEMM epilogue，而不是简单地把通信原样追加到
 GEMM 后面。
 
 如果看完整 combine 对比：
 
 ```text
-GEMM + pack/local-reduce + reduce-scatter ≈ 3282 us
-fused combine-scatter + local reduction   ≈ 2069 us
+GEMM + pack/local-reduce + reduce-scatter ≈ 3296 us
+fused combine-scatter + local reduction   ≈ 1850 us
 ```
 
-当前 fused 路径快约 `1.59x`。不过这个结论要谨慎解读：reduce-scatter baseline
-里的 pack/local-reduce kernel 目前是朴素 atomic 实现，单独就要约 `1289 us` event；
+当前 fused 路径快约 `1.78x`。不过这个结论要谨慎解读：reduce-scatter baseline
+里的 pack/local-reduce kernel 目前是朴素 atomic 实现，单独就要约 `1300 us` event；
 NCCL reduce-scatter 本身约 `1158 us` event。因此这条 baseline 现在更多用于建立数学等价
 验证和性能参照，不能代表充分优化后的 reduce-scatter 方案上限。
 
@@ -636,12 +640,17 @@ GEMM without scatter ≈ 1470.81 us
 GEMM2-style no-gather A、target shape 的当前 baseline 为：
 
 ```text
-GEMM without scatter ≈ 867.71 us
+GEMM without scatter ≈ 862.22 us
 ```
 
-因此当前 fused epilogue 仍然额外引入约 `766 us` wall time，或约 `741 us` event。
+因此当前 fused epilogue 仍然额外引入约 `787 us` wall time，或约 `713 us` event。
 score multiply 已经移到 local reduction，fused epilogue 的额外成本主要来自
 `accumulator -> shared memory -> 16B peer store` 这条写回路径以及 remote store 本身。
+
+本次 local reduction 优化把 scored reduction 从旧实现的约 `422.82 us`
+wall / `381.58 us` event 降到约 `201.82 us` wall / `162.29 us` event。优化来自
+按 token 和 N tile 分块、模板化 `top_k`、把 score 缓存在 shared memory，并移除
+per-element 的除法/取模。
 
 ### 6.4 诊断实验结论
 
@@ -666,7 +675,7 @@ score multiply 已经移到 local reduction，fused epilogue 的额外成本主�
 
 ## 7. 当前局限与后续方向
 
-### 7.1 local reduction 已独立实现，尚未融合
+### 7.1 local reduction 已独立实现并完成第一轮优化
 
 本实现把每个 expert output 以 raw BF16 写入：
 
@@ -680,8 +689,9 @@ combine_buffer[token, topk_slot, :]
 out[token, :] += combine_buffer[token, topk_slot, :] * topk_scores[token, topk_slot]
 ```
 
-因此当前已经覆盖 fc2 输出的 remote scatter 和 source-rank local combine，但 scatter
-和 reduction 仍然是两个 kernel，中间通过 BF16 combine buffer 连接。
+因此当前已经覆盖 fc2 输出的 remote scatter 和 source-rank local combine。第一轮优化后，
+local reduction 在目标 shape 上约为 `162 us` event，但 scatter 和 reduction 仍然是两个
+kernel，中间通过 BF16 combine buffer 连接。
 
 ### 7.2 可能的优化方向
 
@@ -699,11 +709,11 @@ out[token, :] += combine_buffer[token, topk_slot, :] * topk_scores[token, topk_s
    的写回模式，再由 source rank 做 local reduction。这会改变 buffer contract，
    但可能比直接写 final `[token, topk, n]` slot 更适合高性能 epilogue。
 
-3. **优化 local reduction**
+3. **继续评估 local reduction 的融合机会**
 
-   score multiply 已经从 GEMM epilogue 移到 local reduction。后续需要优化
-   `combine_reduce_slots` 的访存和向量化，评估它是否能和后续算子融合，或者是否有
-   更适合 top-k 维度 reduction 的 layout。
+   `combine_reduce_slots` 已经从朴素 per-element kernel 优化为 token/tile 分块。
+   后续主要看它是否能和下游算子融合，或者是否需要改变 combine buffer layout 来减少
+   中间 BF16 写读。
 
 4. **优化 reduce-scatter baseline 的 pack/local-reduce**
 
