@@ -276,6 +276,7 @@ local reduction 时会看不到 remote slot。
 
 最早的直接实现是从 accumulator lane 里取 BF16x2，然后每次发一个小的 global
 store。这个版本可以工作，但 store 粒度太小，peer store 数量太多，性能很差。
+后续曾经把它做成模板参数重新实测，结果仍然明显退化，因此相关代码已经撤回。
 
 当前实现改成两步：
 
@@ -775,6 +776,71 @@ workspace/logs/bench_compact_ring_order_h200.log
 - 更大的成本来自当前 epilogue 结构：`accumulator -> shared memory -> 16B STG`
   这条路径引入了额外 STSM、barrier、shared-memory read 和 scatter loop。
 
+### 6.6 已撤回的失败尝试
+
+为了确认是否能避开当前 `STSM -> smem reload -> 16B peer STG` 路径，做过两类实验：
+
+1. **direct accumulator BF16x2 peer store**
+
+   在 combine-scatter epilogue 中跳过 row-major shared-memory staging，直接由
+   WGMMA accumulator owner lanes 把 BF16x2 写到 peer combine buffer。
+
+2. **row-major peer TMA store**
+
+   重新加回 rank-padded layout，让每个 M tile 只对应一个 source rank，然后用 TMA
+   写一个 row-major peer intermediate buffer。该实验分两种：
+
+   - fixed-peer：所有 tile 都写到固定的 `(rank + 1) % world_size` peer buffer。
+   - tile-rank：按 `tile_rank[m_tile]` 选择 source rank 的 peer buffer，并用
+     writer-rank slice 避免多个 writer 写同一位置。
+
+这些实验均未保留在代码中。它们只用于判断性能上限，不是最终 combine 语义的一部分。
+
+目标 shape：
+
+```text
+ranks=8
+global tokens=55808
+tokens/rank=6976
+local_top_k=2
+global_top_k=16
+hidden=1280
+N=2048
+rank-padded m_logical=131328
+```
+
+H200 结果：
+
+| 路径 | wall median | event median | 结论 |
+| --- | ---: | ---: | --- |
+| no-scatter GEMM | 863.96 us | 841.38 us | 同一轮实验的纯 GEMM 参考 |
+| current fused scatter：STSM + 16B peer STG | 1641.49 us | 1574.59 us | 当前保留路径 |
+| direct BF16x2 peer store | 2892.12 us | 2840.29 us | 明显更慢，store 粒度过小 |
+| fixed-peer row-major TMA store | 1567.83 us | 1521.94 us | 不是 final combine 语义，仅比当前 fused 略快 |
+| fixed-peer row-major STG store | 1583.97 us | 1538.16 us | 和 fixed-peer TMA 接近 |
+| tile-rank row-major TMA store | 1571.69 us | 1511.01 us | 动态按 tile 选 peer descriptor 不是主要额外开销 |
+
+分析：
+
+- direct BF16x2 store 虽然省掉 STSM、barrier 和 smem reload，但把 16B 合并写退化成大量
+  4B peer writes，peer store 指令数量和合并效率都很差，因此不值得保留。
+- TMA 只能很好地描述规则 row-major intermediate，不能直接表达最终
+  `combine_buffer[token, topk_slot, n]` 的 per-row 动态目标地址。
+- 即使在 row-major intermediate 这个更有利的 upper-bound 实验里，TMA store 仍然在
+  `~1.5 ms event`，相比 no-scatter GEMM 仍多约 `670 us`。它没有把主要差距消掉。
+- fixed-peer TMA、fixed-peer STG、tile-rank TMA 三者接近，说明动态选择 peer descriptor
+  不是主要问题；主要成本仍来自 epilogue 写回结构和 remote write 本身。
+- 因此当前代码保持单一路径：`STSM -> 16B vector peer STG -> local reduction`。
+  direct-store 和 tile-rank TMA 实验代码均撤回，只在文档中保留结论。
+
+相关 log：
+
+```text
+workspace/logs/bench_direct_store_core_h200.log
+workspace/logs/bench_tile_rank_tma_h200.log
+workspace/logs/bench_tile_rank_tma_check_h200.log
+```
+
 ---
 
 ## 7. 当前局限与后续方向
@@ -813,11 +879,12 @@ kernel，中间通过 BF16 combine buffer 连接。
    fused scatter 的主瓶颈。后续应继续关注 peer-store 指令形态、store 粒度、写入合并
    以及 epilogue 内等待和 barrier 的成本。
 
-3. **写 row-major intermediate，再做 local combine**
+3. **暂不优先推进 row-major TMA intermediate**
 
-   如果最终 combine 允许先写一个 row-major intermediate buffer，可以重新使用更规则
-   的写回模式，再由 source rank 做 local reduction。这会改变 buffer contract，
-   但可能比直接写 final `[token, topk, n]` slot 更适合高性能 epilogue。
+   已经做过 fixed-peer 和 tile-rank row-major TMA 实验。它们证明动态 source-rank
+   descriptor 选择本身不是主要瓶颈，但 row-major TMA upper-bound 仍然没有显著改善
+   端到端性能。除非后续整体 combine contract 发生变化，否则不应继续在这条线上投入
+   大量工程复杂度。
 
 4. **继续评估 local reduction 的融合机会**
 
