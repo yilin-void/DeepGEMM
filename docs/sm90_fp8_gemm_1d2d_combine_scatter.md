@@ -484,6 +484,7 @@ tests/bench_combine_scatter.py
 --bench-reduce-scatter        # 同时跑 GEMM + pack/local-reduce + NCCL reduce-scatter baseline
 --no-gather-a                 # GEMM2-style：A/SFA 已按 grouped row 连续排布
 --scatter-rows-per-block      # standalone scatter-copy 的 rows/CTA，默认 4
+--compact-layout-order        # compact GEMM2 row order：token 或 ring，默认 token
 ```
 
 该脚本只测 combine 相关路径，不把 all-gather 放进 timed path。每个 rank 用相同
@@ -506,16 +507,41 @@ slots，避免 random routing 下的写冲突。
 当前目标 shape：
 
 ```text
-global tokens = 55808
-local routed rows before expert padding = 55808 * 2 = 111616
+num_ranks = 8
+global source tokens = 55808
+source tokens per rank = 55808 / 8 = 6976
+experts per token on each rank = 2
+global top-k per token = 8 * 2 = 16
+local routed rows per rank before expert padding = 55808 * 2 = 111616
+global routed rows before expert padding = 55808 * 16 = 892928
 intermediate hidden = 1280
 hidden = 2048
 ```
+
+这里的 `55808` 是 8 个 rank 合计的原始 source token 数，不是每 rank token 数，也不是
+route 后的 GEMM M。因为 `all-ranks-local` routing 会让每个 source token 在每个 rank
+上命中 2 个 local experts，所以每个 rank 实际执行的 fc2 grouped GEMM 行数是
+`55808 * 2 = 111616`。
+
+GEMM2 benchmark 默认使用 compact GEMM2 layout：按 local expert 聚合 row，不再按
+source rank 切 chunk，也不再使用 allgather-overlap 所需的 per-rank tile padding。
+当前 DeepGEMM contiguous psum layout 仍要求 expert 起点按 128 对齐，所以
+benchmark 输出里的 `m_logical` 会从真实 row 数 `111616` 增加到 `115456`。旧的
+rank-padded overlap layout 会得到 `m_logical=131328`，可用
+`--rank-padded-gemm2-layout` 复现。
+
+compact GEMM2 layout 的 row order 可以通过 `--compact-layout-order` 控制：
+
+- `token`：默认模式。每个 expert 内按 global source token 顺序排列 row。
+- `ring`：每个 expert 内按当前 rank 起点的 source-rank ring order 排列 row，即
+  `rank, rank + 1, ...`。该模式用于检查目的 rank 写入热点是否会明显影响
+  combine-scatter epilogue。
 
 对应到 benchmark 参数：
 
 ```text
 tokens_per_rank = 55808 / 8 = 6976
+top_k           = 16     # 8 ranks * 2 local experts per rank
 hidden           = 1280   # GEMM K, fc2 input/intermediate dimension
 n                = 2048   # GEMM N, fc2 output/hidden dimension
 ```
@@ -542,7 +568,7 @@ python3 tests/bench_combine_scatter.py \
 log：
 
 ```text
-workspace/logs/bench_combine_scatter_reduce_opt_target_h200.log
+外层 workspace/logs/bench_compact_gemm2_latest_h200.log
 ```
 
 ### 6.2 结果
@@ -555,9 +581,10 @@ tokens/rank = 6976
 hidden = 1280
 global_top_k = 16
 local_top_k = 2
-m_logical = 131328
+m_logical = 115456
 n = 2048
 gather_a = false
+layout = compact-gemm2/token
 ```
 
 结果按方案拆分如下。表里 `total` 是直接测整条路径的 median，不是把各组件 median
@@ -565,18 +592,18 @@ gather_a = false
 
 | 方案 | 组件 | 时间 |
 | --- | --- | ---: |
-| common | GEMM no scatter | 862.22 us (event 850.70 us) |
-| fused scatter | fused GEMM + raw scatter | 1649.21 us (event 1563.26 us) |
-| two-stage scatter-copy | GEMM no scatter | 862.22 us (event 850.70 us) |
-| two-stage scatter-copy | raw scatter-copy | 1227.08 us (event 1184.05 us, 386.12 GB/s) |
-| two-stage scatter-copy | total GEMM + scatter-copy | 2035.26 us (event 1983.41 us) |
-| reduce-scatter baseline | GEMM no scatter | 862.22 us (event 850.70 us) |
-| reduce-scatter baseline | pack/local-reduce | 1341.52 us (event 1299.76 us) |
-| reduce-scatter baseline | NCCL reduce-scatter SUM | 1201.39 us (event 1158.22 us, alg-bw 345.38 GB/s) |
-| reduce-scatter baseline | total GEMM + pack + RS | 3295.54 us |
-| fused scatter + local reduction | fused GEMM + raw scatter | 1649.21 us (event 1563.26 us) |
-| fused scatter + local reduction | scored local reduction | 201.82 us (event 162.29 us) |
-| fused scatter + local reduction | total fused + local reduction | 1849.99 us |
+| common | GEMM no scatter | 779.00 us (event 735.62 us) |
+| fused scatter | fused GEMM + raw scatter | 1633.01 us (event 1580.45 us) |
+| two-stage scatter-copy | GEMM no scatter | 779.00 us (event 735.62 us) |
+| two-stage scatter-copy | raw scatter-copy | 1264.02 us (event 1186.74 us, 385.24 GB/s) |
+| two-stage scatter-copy | total GEMM + scatter-copy | 1997.72 us (event 1918.06 us) |
+| reduce-scatter baseline | GEMM no scatter | 779.00 us (event 735.62 us) |
+| reduce-scatter baseline | pack/local-reduce | 1303.24 us (event 1227.70 us) |
+| reduce-scatter baseline | NCCL reduce-scatter SUM | 1201.19 us (event 1157.57 us, alg-bw 345.58 GB/s) |
+| reduce-scatter baseline | total GEMM + pack + RS | 3132.18 us |
+| fused scatter + local reduction | fused GEMM + raw scatter | 1633.01 us (event 1580.45 us) |
+| fused scatter + local reduction | scored local reduction | 250.26 us (event 177.70 us) |
+| fused scatter + local reduction | total fused + local reduction | 1839.50 us |
 
 correctness：
 
@@ -602,7 +629,7 @@ tokens_per_rank * top_k * n * sizeof(bf16)
 对应带宽：
 
 ```text
-457.2 MB / 1.18238 ms = 386.66 GB/s
+457.2 MB / 1.18674 ms = 385.24 GB/s
 ```
 
 ### 6.3 解读
@@ -610,23 +637,23 @@ tokens_per_rank * top_k * n * sizeof(bf16)
 以 two-stage 为 baseline：
 
 ```text
-two-stage event       ≈ 1983 us
-fused combine-scatter ≈ 1563 us
+two-stage event       ≈ 1918 us
+fused combine-scatter ≈ 1580 us
 ```
 
-fused epilogue 省掉约 `420 us`，约 `1.27x`。这说明 fused 路径确实把独立
+fused epilogue 省掉约 `338 us`，约 `1.21x`。这说明 fused 路径确实把独立
 scatter-copy 的大部分成本藏进了 GEMM epilogue，而不是简单地把通信原样追加到
 GEMM 后面。
 
 如果看完整 combine 对比：
 
 ```text
-GEMM + pack/local-reduce + reduce-scatter ≈ 3296 us
-fused combine-scatter + local reduction   ≈ 1850 us
+GEMM + pack/local-reduce + reduce-scatter ≈ 3132 us
+fused combine-scatter + local reduction   ≈ 1840 us
 ```
 
-当前 fused 路径快约 `1.78x`。不过这个结论要谨慎解读：reduce-scatter baseline
-里的 pack/local-reduce kernel 目前是朴素 atomic 实现，单独就要约 `1300 us` event；
+当前 fused 路径快约 `1.70x`。不过这个结论要谨慎解读：reduce-scatter baseline
+里的 pack/local-reduce kernel 目前是朴素 atomic 实现，单独就要约 `1228 us` event；
 NCCL reduce-scatter 本身约 `1158 us` event。因此这条 baseline 现在更多用于建立数学等价
 验证和性能参照，不能代表充分优化后的 reduce-scatter 方案上限。
 
@@ -640,19 +667,96 @@ GEMM without scatter ≈ 1470.81 us
 GEMM2-style no-gather A、target shape 的当前 baseline 为：
 
 ```text
-GEMM without scatter ≈ 862.22 us
+GEMM without scatter ≈ 779.00 us
 ```
 
-因此当前 fused epilogue 仍然额外引入约 `787 us` wall time，或约 `713 us` event。
+因此当前 fused epilogue 仍然额外引入约 `854 us` wall time，或约 `845 us` event。
 score multiply 已经移到 local reduction，fused epilogue 的额外成本主要来自
 `accumulator -> shared memory -> 16B peer store` 这条写回路径以及 remote store 本身。
 
-本次 local reduction 优化把 scored reduction 从旧实现的约 `422.82 us`
-wall / `381.58 us` event 降到约 `201.82 us` wall / `162.29 us` event。优化来自
+local reduction 优化把 scored reduction 从旧实现的约 `422.82 us`
+wall / `381.58 us` event 降到约 `250.26 us` wall / `177.70 us` event。优化来自
 按 token 和 N tile 分块、模板化 `top_k`、把 score 缓存在 shared memory，并移除
 per-element 的除法/取模。
 
-### 6.4 诊断实验结论
+### 6.4 compact layout row-order 实验
+
+为了确认 fused scatter 的额外开销是否来自 source-rank row order 导致的 peer-store
+热点，benchmark 增加了 `--compact-layout-order {token,ring}`。
+
+其中 `ring` 模式只改变每个 expert 内真实 row 的排列顺序，不改变数学语义：
+
+- `combine_src_index` 仍然指向同一个 source token 集合。
+- `row_to_topk` 仍然指向对应 rank 的 top-k slot。
+- `psum_layout` 仍使用真实 row 结束边界，避免重新引入 expert padding work。
+- `m_logical` 仍为 `115456`，padding rows 仍为 `3840`。
+
+correctness smoke：
+
+```text
+layout = compact-gemm2/ring
+Fused combine-scatter epilogue value check:
+max_abs_diff = 0
+mismatches   = 0
+
+CPU reference check for fused scatter + local reduction:
+max_abs_diff = 0.00012207
+tokens       = 32
+mismatches   = 0
+```
+
+core-only 对比命令只保留 fused path 和 local reduction，使用 `warmups=10`、
+`iters=50`：
+
+```bash
+python3 tests/bench_combine_scatter.py \
+  --num-local-ranks 8 \
+  --tokens-per-rank 6976 \
+  --hidden 1280 \
+  --n 2048 \
+  --top-k 16 \
+  --global-num-experts 512 \
+  --experts-per-rank-token 2 \
+  --no-gather-a \
+  --compact-layout-order token \
+  --warmups 10 \
+  --iters 50
+```
+
+把 `--compact-layout-order token` 改成 `ring` 即可复现 ring-order 对比。
+
+结果：
+
+| compact layout order | GEMM no scatter | fused GEMM + scatter | local reduction | total fused + local reduction |
+| --- | ---: | ---: | ---: | ---: |
+| `token` | 825.26 us (event 810.75 us) | 1636.27 us (event 1572.69 us) | 202.16 us (event 162.21 us) | 1840.91 us |
+| `ring` | 777.25 us (event 789.52 us) | 1636.59 us (event 1568.43 us) | 201.10 us (event 161.81 us) | 1842.06 us |
+
+带 standalone scatter-copy 的辅助对比，使用 `warmups=10`、`iters=20`：
+
+| compact layout order | raw scatter-copy | total GEMM + scatter-copy |
+| --- | ---: | ---: |
+| `token` | 1259.73 us (event 1188.11 us, 384.79 GB/s) | 1994.24 us (event 1917.02 us) |
+| `ring` | 1222.41 us (event 1179.94 us, 387.46 GB/s) | 1944.21 us (event 1898.59 us) |
+
+结论：
+
+- ring-order 对 fused GEMM + scatter 的 event time 只改善约 `4.26 us`，约 `0.27%`。
+- standalone scatter-copy 有约 `0.7%` 的 event time 改善，但幅度仍然很小。
+- 这说明当前主要瓶颈不是简单的 source-rank row order 热点。后续优化应继续聚焦
+  combine-scatter epilogue 的 remote store 路径和 accumulator 写回结构。
+
+相关 log：
+
+```text
+workspace/logs/bench_compact_ring_check_h200.log
+workspace/logs/bench_compact_token_order_core_h200.log
+workspace/logs/bench_compact_ring_order_core_h200.log
+workspace/logs/bench_compact_token_order_h200.log
+workspace/logs/bench_compact_ring_order_h200.log
+```
+
+### 6.5 诊断实验结论
 
 为了定位融合 scatter 的额外开销，曾经在 score multiply 合入之前做过几组一次性
 诊断实验。这些诊断开关已经从正式 benchmark 中移除，但结果对后续优化仍有参考价值。
@@ -690,7 +794,7 @@ out[token, :] += combine_buffer[token, topk_slot, :] * topk_scores[token, topk_s
 ```
 
 因此当前已经覆盖 fc2 输出的 remote scatter 和 source-rank local combine。第一轮优化后，
-local reduction 在目标 shape 上约为 `162 us` event，但 scatter 和 reduction 仍然是两个
+local reduction 在目标 shape 上约为 `178 us` event，但 scatter 和 reduction 仍然是两个
 kernel，中间通过 BF16 combine buffer 连接。
 
 ### 7.2 可能的优化方向
@@ -703,25 +807,31 @@ kernel，中间通过 BF16 combine buffer 连接。
    memory。诊断显示这部分本身已经很贵。需要探索是否能在不退回 BF16x2 小 store
    的情况下减少 staging/barrier 成本。
 
-2. **写 row-major intermediate，再做 local combine**
+2. **继续优化 remote store 路径，而不是优先调整 compact row order**
+
+   `--compact-layout-order ring` 只带来噪声级改善，说明 source-rank row order 不是当前
+   fused scatter 的主瓶颈。后续应继续关注 peer-store 指令形态、store 粒度、写入合并
+   以及 epilogue 内等待和 barrier 的成本。
+
+3. **写 row-major intermediate，再做 local combine**
 
    如果最终 combine 允许先写一个 row-major intermediate buffer，可以重新使用更规则
    的写回模式，再由 source rank 做 local reduction。这会改变 buffer contract，
    但可能比直接写 final `[token, topk, n]` slot 更适合高性能 epilogue。
 
-3. **继续评估 local reduction 的融合机会**
+4. **继续评估 local reduction 的融合机会**
 
    `combine_reduce_slots` 已经从朴素 per-element kernel 优化为 token/tile 分块。
    后续主要看它是否能和下游算子融合，或者是否需要改变 combine buffer layout 来减少
    中间 BF16 写读。
 
-4. **优化 reduce-scatter baseline 的 pack/local-reduce**
+5. **优化 reduce-scatter baseline 的 pack/local-reduce**
 
    当前 `combine_pack_for_reduce_scatter` 使用 per-element float `atomicAdd`，只是为了
    快速建立等价 baseline。后续可以利用 gather layout 中 `all-ranks-local` 的结构，
    按 token 或 tile 聚合，避免大规模 atomic，才能更公平地评估 reduce-scatter 方案。
 
-5. **重新评估 H100 NVLink 目标环境**
+6. **重新评估 H100 NVLink 目标环境**
 
    当前数据来自 H200。最终 target 是 NVLink H100，因此 peer store 部分仍需要在
    H100 HBM3 / H100 NVL 上复测。
