@@ -7,7 +7,7 @@
 
 namespace deep_gemm {
 
-template <uint32_t kNumThreads>
+template <uint32_t kNumThreads, uint32_t kTopK, uint32_t kColsPerThread>
 __global__ void combine_reduce_slots_kernel(
     const __nv_bfloat16* __restrict__ combine_buffer,
     const float* __restrict__ topk_scores,
@@ -15,22 +15,38 @@ __global__ void combine_reduce_slots_kernel(
     uint32_t tokens_per_rank,
     uint32_t top_k,
     uint32_t n) {
-    const uint64_t total = static_cast<uint64_t>(tokens_per_rank) * n;
-    for (uint64_t idx = static_cast<uint64_t>(blockIdx.x) * kNumThreads + threadIdx.x;
-         idx < total;
-         idx += static_cast<uint64_t>(gridDim.x) * kNumThreads) {
-        const uint32_t token = static_cast<uint32_t>(idx / n);
-        const uint32_t col = static_cast<uint32_t>(idx - static_cast<uint64_t>(token) * n);
-        float acc = 0.0f;
-        #pragma unroll 1
-        for (uint32_t slot = 0; slot < top_k; ++slot) {
-            const uint64_t offset =
-                (static_cast<uint64_t>(token) * top_k + slot) * n + col;
-            const float score = __ldg(topk_scores +
-                                      static_cast<uint64_t>(token) * top_k + slot);
-            acc += __bfloat162float(combine_buffer[offset]) * score;
+    const uint32_t token = blockIdx.x;
+    if (token >= tokens_per_rank)
+        return;
+
+    __shared__ float s_scores[kTopK];
+    if (threadIdx.x < kTopK)
+        s_scores[threadIdx.x] = __ldg(topk_scores + static_cast<uint64_t>(token) * top_k + threadIdx.x);
+    __syncthreads();
+
+    constexpr uint32_t kBlockN = kNumThreads * kColsPerThread;
+    const uint32_t col_base = blockIdx.y * kBlockN + threadIdx.x;
+    float acc[kColsPerThread] = {0.0f};
+
+    #pragma unroll
+    for (uint32_t slot = 0; slot < kTopK; ++slot) {
+        const float score = s_scores[slot];
+        const uint64_t slot_offset =
+            (static_cast<uint64_t>(token) * top_k + slot) * n;
+        #pragma unroll
+        for (uint32_t i = 0; i < kColsPerThread; ++i) {
+            const uint32_t col = col_base + i * kNumThreads;
+            if (col < n)
+                acc[i] += __bfloat162float(combine_buffer[slot_offset + col]) * score;
         }
-        out[idx] = acc;
+    }
+
+    const uint64_t out_base = static_cast<uint64_t>(token) * n;
+    #pragma unroll
+    for (uint32_t i = 0; i < kColsPerThread; ++i) {
+        const uint32_t col = col_base + i * kNumThreads;
+        if (col < n)
+            out[out_base + col] = acc[i];
     }
 }
 

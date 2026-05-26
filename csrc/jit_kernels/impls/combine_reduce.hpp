@@ -17,6 +17,7 @@ public:
     struct Args {
         void *combine_buffer, *topk_scores, *out;
         uint32_t tokens_per_rank, top_k, n;
+        uint32_t cols_per_thread;
         LaunchArgs launch_args;
     };
 
@@ -27,9 +28,9 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_slots_kernel<{}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_slots_kernel<{}, {}, {}>);
 }};
-)", args.launch_args.num_threads);
+)", args.launch_args.num_threads, args.top_k, args.cols_per_thread);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -90,9 +91,11 @@ static void combine_reduce_slots(const torch::Tensor& combine_buffer,
     DG_HOST_ASSERT(out.size(0) == tokens64 and out.size(1) == n64);
 
     constexpr int num_threads = 256;
-    const uint64_t total = static_cast<uint64_t>(tokens64) * static_cast<uint64_t>(n64);
-    const int max_blocks = std::max(1, device_runtime->get_num_sms() * 8);
-    const int num_blocks = std::min<int>(max_blocks, static_cast<int>(ceil_div<uint64_t>(total, num_threads)));
+    DG_HOST_ASSERT(tokens64 <= std::numeric_limits<int>::max());
+    DG_HOST_ASSERT(top_k64 <= num_threads);
+    const int cols_per_thread = 2;
+    const int block_n = num_threads * cols_per_thread;
+    const int num_col_blocks = static_cast<int>(ceil_div<int64_t>(n64, block_n));
     const auto args = CombineReduceSlotsRuntime::Args{
         .combine_buffer = combine_buffer.data_ptr(),
         .topk_scores = topk_scores.data_ptr(),
@@ -100,7 +103,8 @@ static void combine_reduce_slots(const torch::Tensor& combine_buffer,
         .tokens_per_rank = static_cast<uint32_t>(tokens64),
         .top_k = static_cast<uint32_t>(top_k64),
         .n = static_cast<uint32_t>(n64),
-        .launch_args = LaunchArgs(num_blocks, num_threads),
+        .cols_per_thread = static_cast<uint32_t>(cols_per_thread),
+        .launch_args = LaunchArgs({static_cast<int>(tokens64), num_col_blocks}, num_threads),
     };
     const auto code = CombineReduceSlotsRuntime::generate(args);
     const auto runtime = compiler->build("combine_reduce_slots", code);
