@@ -140,7 +140,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("tokens_per_rank"),
           py::arg("num_experts"),
           py::arg("block_m"),
-          py::arg("topk_slot_offset") = 0);
+          py::arg("topk_slot_offset") = 0,
+          py::arg("expert_srank_padding") = true);
 #endif
 
     m.def("set_mk_alignment_for_contiguous_layout", [&](const int& new_value) {

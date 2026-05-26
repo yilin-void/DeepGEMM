@@ -71,6 +71,7 @@ public:
     struct Args {
         void *counts, *padded_starts, *m_logical_out;
         uint32_t local_rank, num_experts, num_ranks, block_m;
+        bool expert_srank_padding;
         LaunchArgs launch_args;
     };
 
@@ -89,7 +90,8 @@ static void __instantiate_kernel() {{
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.counts, args.padded_starts, args.m_logical_out,
-            args.local_rank, args.num_experts, args.num_ranks, args.block_m));
+            args.local_rank, args.num_experts, args.num_ranks, args.block_m,
+            args.expert_srank_padding));
     }
 };
 
@@ -100,6 +102,7 @@ public:
     struct Args {
         void *counts, *padded_starts, *tile_rank, *grouped_layout;
         uint32_t local_rank, num_experts, num_ranks, block_m;
+        bool expert_srank_padding;
         LaunchArgs launch_args;
     };
 
@@ -118,7 +121,8 @@ static void __instantiate_kernel() {{
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.counts, args.padded_starts, args.tile_rank, args.grouped_layout,
-            args.local_rank, args.num_experts, args.num_ranks, args.block_m));
+            args.local_rank, args.num_experts, args.num_ranks, args.block_m,
+            args.expert_srank_padding));
     }
 };
 
@@ -193,7 +197,8 @@ build_gather_layout_for_rank_overlap(
     const int& tokens_per_rank,
     const int& num_experts,
     const int& block_m,
-    const int& topk_slot_offset = 0)
+    const int& topk_slot_offset = 0,
+    const bool& expert_srank_padding = true)
 {
     // Input checks
     DG_HOST_ASSERT(routing_topk.dim() == 2);
@@ -222,8 +227,9 @@ build_gather_layout_for_rank_overlap(
     const int64_t total_pairs = static_cast<int64_t>(num_ranks) *
                                 static_cast<int64_t>(tokens_per_rank) *
                                 static_cast<int64_t>(K);
-    const int64_t num_chunks = static_cast<int64_t>(num_experts) *
-                               static_cast<int64_t>(num_ranks);
+    const int64_t num_chunks = expert_srank_padding
+        ? static_cast<int64_t>(num_experts) * static_cast<int64_t>(num_ranks)
+        : static_cast<int64_t>(num_experts);
     const int64_t max_nonempty_chunks = std::min<int64_t>(num_chunks, total_pairs);
     const int64_t M_max64 = total_pairs + max_nonempty_chunks * (block_m - 1);
     DG_HOST_ASSERT(M_max64 < static_cast<int64_t>(std::numeric_limits<int>::max()));
@@ -237,7 +243,9 @@ build_gather_layout_for_rank_overlap(
     // not written by Phase 3 (scatter) automatically reads as a pad row.
     auto gather_index = torch::full({M_max}, -1, opts_int32);
     auto row_to_topk = torch::full({M_max}, -1, opts_int32);
-    auto tile_rank = torch::empty({num_m_tiles_max}, opts_int32);
+    auto tile_rank = expert_srank_padding
+        ? torch::empty({num_m_tiles_max}, opts_int32)
+        : torch::full({num_m_tiles_max}, -1, opts_int32);
     // grouped_layout is fully (re)written by Phase 2b; no need to pre-init.
     auto grouped_layout = torch::empty({M_max}, opts_int32);
     auto m_logical_tensor = torch::empty({1}, opts_int32);
@@ -287,6 +295,7 @@ build_gather_layout_for_rank_overlap(
             .num_experts = static_cast<uint32_t>(num_experts),
             .num_ranks = static_cast<uint32_t>(num_ranks),
             .block_m = static_cast<uint32_t>(block_m),
+            .expert_srank_padding = expert_srank_padding,
             .launch_args = LaunchArgs(1, num_threads, smem_size),
         };
         const auto code = GatherLayoutPrefixRuntime::generate(args);
@@ -312,6 +321,7 @@ build_gather_layout_for_rank_overlap(
             .num_experts = static_cast<uint32_t>(num_experts),
             .num_ranks = static_cast<uint32_t>(num_ranks),
             .block_m = static_cast<uint32_t>(block_m),
+            .expert_srank_padding = expert_srank_padding,
             .launch_args = LaunchArgs({num_experts, num_ranks}, num_threads),
         };
         const auto code = GatherLayoutFillTablesRuntime::generate(args);

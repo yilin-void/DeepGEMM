@@ -203,7 +203,8 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     gather_index, tile_rank, grouped_layout, m_logical_t, psum_layout, _row_to_topk = \
         deep_gemm.build_gather_layout_for_rank_overlap(
             routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m,
-            topk_slot_offset=topk_slot_offset)
+            topk_slot_offset=topk_slot_offset,
+            expert_srank_padding=args.expert_srank_padding)
     m_logical = int(m_logical_t.item())
     num_m_tiles = (m_logical + block_m - 1) // block_m
     expected_m_per_expert = int((m_logical + num_experts - 1) // num_experts * 1.2)
@@ -552,6 +553,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                   f'overlap_gemm_sms={get_reported_overlap_num_sms(deep_gemm.get_num_sms())}', flush=True)
             print(f'  experts={num_experts}, top_k={top_k}, m_logical={m_logical}, '
                   f'n={args.n}, num_weights={args.num_weights}, n_eff={n_eff}', flush=True)
+            print(f'  expert_srank_padding={args.expert_srank_padding}', flush=True)
             print('  common components:', flush=True)
             print(f'    allgather only        : {comm_ms * 1e3:8.2f} us', flush=True)
             if comm_event_ms is not None:
@@ -598,6 +600,11 @@ def main() -> None:
                         choices=('symm', 'nccl-cpp'),
                         help='symm: custom symmetric-memory P2P all-gather; '
                              'nccl-cpp: use a direct C++ ncclAllGather wrapper')
+    parser.add_argument('--expert-srank-padding', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='True: pad each (expert, source-rank) layout chunk. '
+                             'False: preserve rank-minor ordering but pad only at expert boundaries; '
+                             'not safe for rank_flag overlap when one tile mixes source ranks.')
     parser.add_argument('--overlap-reserved-sms', type=int, default=2,
                         help='SMs left unused by GEMM when the selected overlap mode needs GPU-side communication progress')
     parser.add_argument('--num-weights', type=int, default=1,

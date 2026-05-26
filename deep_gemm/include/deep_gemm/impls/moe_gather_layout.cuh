@@ -27,6 +27,16 @@ namespace deep_gemm {
 //           start += n_slot
 //   m_logical = start
 //
+// With expert_srank_padding=false, each expert still stores real rows in the
+// same ring-order rank-minor order, but padding is applied only once at the
+// expert boundary:
+//
+//   for e in [0, num_experts):
+//       expert_start = start
+//       for s in [0, num_ranks):
+//           padded_starts[e][s] = expert_start + sum_{s' < s} count[e][rank(s')]
+//       start += ceil_div(sum_s count[e][rank(s)], block_m) * block_m
+//
 // Indexing conventions used across the four phases:
 //   counts[e][r]         : e-major, raw rank id (NOT ring step)
 //   padded_starts[e][s]  : e-major, ring step inner
@@ -120,7 +130,8 @@ __global__ void prefix_for_gather_layout(
     uint32_t local_rank,
     uint32_t num_experts,
     uint32_t num_ranks,
-    uint32_t block_m)
+    uint32_t block_m,
+    bool expert_srank_padding)
 {
     static_assert(kNumThreads % 32 == 0, "block must contain whole warps");
     constexpr uint32_t kNumWarps = kNumThreads / 32;
@@ -137,6 +148,88 @@ __global__ void prefix_for_gather_layout(
     for (uint32_t i = threadIdx.x; i < total_chunks; i += kNumThreads)
         s_counts[i] = counts[i];
     __syncthreads();
+
+    const uint32_t lane = threadIdx.x & 31;
+    const uint32_t warp_id = threadIdx.x >> 5;
+    __shared__ int s_warp_excl[kNumWarps];
+    __shared__ int s_block_total;
+
+    if (not expert_srank_padding) {
+        // Expert-only padding scans one chunk per expert. Each thread handles a
+        // dynamically sized contiguous expert block, computes padded expert
+        // sizes locally, then the same warp/block scan used by the
+        // per-(expert,rank) path gives each expert its M offset. Keeping the
+        // per-thread block small for common <=256-expert cases avoids the old
+        // 4-thread bottleneck when local num_experts=64.
+        const uint32_t experts_per_thread = (num_experts + kNumThreads - 1) / kNumThreads;
+        DG_TRAP_ONLY_DEVICE_ASSERT(experts_per_thread <= kChunksPerThread);
+        const uint32_t base = threadIdx.x * experts_per_thread;
+        int local_n_slot[kChunksPerThread];
+        int local_total = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < kChunksPerThread; ++i) {
+            const uint32_t e = base + i;
+            int n_slot = 0;
+            if (i < experts_per_thread and e < num_experts) {
+                int n_total = 0;
+                for (uint32_t s = 0; s < num_ranks; ++s) {
+                    const uint32_t r = (local_rank + s) % num_ranks;
+                    n_total += s_counts[e * num_ranks + r];
+                }
+                n_slot = ((n_total + static_cast<int>(block_m) - 1)
+                          / static_cast<int>(block_m))
+                         * static_cast<int>(block_m);
+            }
+            local_n_slot[i] = n_slot;
+            local_total += n_slot;
+        }
+
+        int warp_inc = local_total;
+        #pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(0xffffffffu, warp_inc, o);
+            if (lane >= static_cast<uint32_t>(o)) warp_inc += v;
+        }
+
+        if (lane == 31u)
+            s_warp_excl[warp_id] = warp_inc;
+        __syncthreads();
+
+        if (warp_id == 0u) {
+            int v = (lane < kNumWarps) ? s_warp_excl[lane] : 0;
+            int incl = v;
+            #pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int u = __shfl_up_sync(0xffffffffu, incl, o);
+                if (lane >= static_cast<uint32_t>(o)) incl += u;
+            }
+            if (lane < kNumWarps)
+                s_warp_excl[lane] = incl - v;
+            if (lane == kNumWarps - 1u)
+                s_block_total = incl;
+        }
+        __syncthreads();
+
+        const int my_excl_prefix = s_warp_excl[warp_id] + (warp_inc - local_total);
+        int prefix = my_excl_prefix;
+        #pragma unroll
+        for (uint32_t i = 0; i < kChunksPerThread; ++i) {
+            const uint32_t e = base + i;
+            if (i < experts_per_thread and e < num_experts) {
+                int n_total = 0;
+                for (uint32_t s = 0; s < num_ranks; ++s) {
+                    const uint32_t r = (local_rank + s) % num_ranks;
+                    padded_starts[e * num_ranks + s] = prefix + n_total;
+                    n_total += s_counts[e * num_ranks + r];
+                }
+                prefix += local_n_slot[i];
+            }
+        }
+
+        if (threadIdx.x == 0)
+            *m_logical_out = s_block_total;
+        return;
+    }
 
     // Step 2: each thread computes `n_slot` for its blocked range of chunks
     // (block layout: thread tid handles [tid * kChunksPerThread, ...) ).
@@ -162,8 +255,6 @@ __global__ void prefix_for_gather_layout(
 
     // Step 3: block-wide exclusive scan over `local_total`.
     //   3a: intra-warp inclusive scan via shfl_up.
-    const uint32_t lane = threadIdx.x & 31;
-    const uint32_t warp_id = threadIdx.x >> 5;
     int warp_inc = local_total;
     #pragma unroll
     for (int o = 1; o < 32; o <<= 1) {
@@ -172,8 +263,6 @@ __global__ void prefix_for_gather_layout(
     }
 
     //   3b: per-warp totals → smem; one warp scans those totals; broadcast.
-    __shared__ int s_warp_excl[kNumWarps];
-    __shared__ int s_block_total;
     if (lane == 31u)
         s_warp_excl[warp_id] = warp_inc;
     __syncthreads();
@@ -239,11 +328,43 @@ __global__ void fill_layout_tables_for_gather_layout(
     uint32_t local_rank,
     uint32_t num_experts,
     uint32_t num_ranks,
-    uint32_t block_m)
+    uint32_t block_m,
+    bool expert_srank_padding)
 {
     const uint32_t e = blockIdx.x;
     const uint32_t s = blockIdx.y;
     if (e >= num_experts or s >= num_ranks) return;
+
+    if (not expert_srank_padding) {
+        if (s != 0)
+            return;
+
+        int n_total = 0;
+        int rank_counts[8];
+        #pragma unroll
+        for (uint32_t rs = 0; rs < 8; ++rs)
+            rank_counts[rs] = 0;
+        for (uint32_t rs = 0; rs < num_ranks; ++rs) {
+            const uint32_t r = (local_rank + rs) % num_ranks;
+            const int n_real = counts[e * num_ranks + r];
+            rank_counts[rs] = n_real;
+            n_total += n_real;
+        }
+        const int n_slot = ((n_total + static_cast<int>(block_m) - 1)
+                            / static_cast<int>(block_m))
+                           * static_cast<int>(block_m);
+        if (n_slot == 0)
+            return;
+
+        const int start = padded_starts[e * num_ranks];
+        for (int i = threadIdx.x; i < n_slot; i += kNumThreads)
+            grouped_layout[start + i] = static_cast<int>(e);
+
+        // tile_rank is host-initialized to -1 for expert-only padding. A tile
+        // may mix multiple source ranks, so a single rank id would be unsafe
+        // for rank-flag overlap waits.
+        return;
+    }
 
     const uint32_t r = (local_rank + s) % num_ranks;
     const int n_real = counts[e * num_ranks + r];
