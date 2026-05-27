@@ -158,6 +158,7 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
+          bool kSFAIsMNMajor, bool kHasGatherIndex, bool kHasRankFlags,
           bool kCombineScatter,
           typename epilogue_type_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
@@ -167,15 +168,16 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         uint32_t stride_a,          // row stride of A in fp8 elements
                         const float* __restrict__ gmem_sfa,
                         uint32_t stride_sfa,        // MN-major: K-scale stride; raw row-major: row stride
-                        bool sfa_is_mn_major,
                         const int* __restrict__ gather_index,
                         // Per-rank ready-flag overlap (optional). All four must be set together
                         // (or all unset). See docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md.
                         //   rank_flags      : (num_ranks,) int64 on global memory; written to
                         //                     `rank_flag_epoch` by the comm stream once that rank's
                         //                     tokens are visible in `gmem_a`.
-                        //   tile_rank       : (ceil(shape_m/BLOCK_M),) int32. Each entry is the
-                        //                     unique rank that the corresponding M tile depends on.
+                        //   tile_rank       : (ceil(shape_m/BLOCK_M),) int32. Non-negative entries
+                        //                     are the unique rank that the corresponding M tile
+                        //                     depends on. Negative entries mean mixed/unknown ranks
+                        //                     and conservatively wait for all ranks.
                         //   num_ranks       : runtime rank count, must satisfy `num_ranks <= 8`.
                         //   rank_flag_epoch : monotonically increasing epoch; the kernel spins
                         //                     until `ld.acquire.sys(rank_flags[r]) >= epoch`.
@@ -194,6 +196,9 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_d,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
+    static_assert(not kHasRankFlags or kHasGatherIndex, "rank flags require gather_index");
+    static_assert(not kCombineScatter or kHasGatherIndex, "combine-scatter requires gather_index");
+
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
     DG_STATIC_ASSERT(
@@ -280,7 +285,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     // sm90.hpp) leaves >256 B slack vs. the actual `2 * kNumStages` barriers we
     // use, so 32 B for `s_rank_seen` fits without bumping `smem_size`.
     static constexpr uint32_t kNumRanksMax = 8;
-    auto s_rank_seen = reinterpret_cast<uint32_t*>(barrier_start_ptr + 2 * kNumStages);
+    auto smem_tail = reinterpret_cast<uint8_t*>(barrier_start_ptr + 2 * kNumStages);
+    uint32_t* s_rank_seen = nullptr;
+    if constexpr (kHasRankFlags)
+        s_rank_seen = reinterpret_cast<uint32_t*>(smem_tail);
 
 #if DG_BARRIER_DEBUG
     // Diagnose SMEM layout: print offsets and total usage (block 0, thread 0 only).
@@ -317,12 +325,12 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
         }
 
-        // Zero-init the per-rank "seen" cache. Only used when
-        // `rank_flags != nullptr`, but always cleared so the runtime check
-        // inside the producer loop is uniform.
-        #pragma unroll
-        for (uint32_t i = 0; i < kNumRanksMax; ++ i)
-            s_rank_seen[i] = 0;
+        if constexpr (kHasRankFlags) {
+            // Zero-init the per-rank "seen" cache for rank-flag kernels only.
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumRanksMax; ++ i)
+                s_rank_seen[i] = 0;
+        }
 
         // Make initialized barrier visible in async proxy
         cutlass::arch::fence_barrier_init();
@@ -332,10 +340,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
 
     // Register reconfigurations
-    // Producer WG (merged TMA + cp.async): needs address arithmetic for cp.async A/sfa
-    // plus a single elected thread per k-tile issuing TMA B → 40 regs fits both.
-    constexpr uint32_t kNumProducerRegisters = 64;
-    constexpr uint32_t kNumMathRegisters     = kNumMathThreads == 128 ? 248 : 216;
+    // Keep enough producer registers for fused gather address arithmetic while
+    // giving the math warp-groups a spill-free budget.
+    constexpr uint32_t kNumProducerRegisters = 48;
+    constexpr uint32_t kNumMathRegisters     = kNumMathThreads == 128 ? 248 : 224;
 
     static constexpr uint32_t kCpAsyncWidth   = 16;
     static constexpr uint32_t kCpAsyncThreads = 128;
@@ -345,6 +353,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                   "Not enough cp.async threads for A load");
     static_assert(SMEM_A_SIZE_PER_STAGE % (kCpAsyncThreads * kCpAsyncWidth) == 0,
                   "A smem size must be divisible by (128 * 16)");
+    static constexpr uint32_t kAThreadsPerRow = BLOCK_K / kCpAsyncWidth;
+    static constexpr uint32_t kRowsPerAIter = kCpAsyncThreads / kAThreadsPerRow;
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
@@ -383,11 +393,6 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
         const uint32_t tid_in_wg   = threadIdx.x - kNumMathThreads;            // [0, 128)
         const uint32_t warp_in_wg  = warp_idx - kNumMathThreads / 32;          // [0, 4)
-        const bool has_gather_index = gather_index != nullptr;
-        // Per-rank flag overlap is only active when the caller wired up all three
-        // tensors. Using the conjunction here lets the no-overlap path constant-fold
-        // out of the producer loop body.
-        const bool has_rank_flags = (rank_flags != nullptr) and (tile_rank != nullptr);
 
         // `kPadSentinel == (uint32_t)-1` doubles as the natural cast result of
         // `gather_index[i] = -1`, the "pad row" signal documented in
@@ -402,8 +407,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
             // ----- Per-rank ready-flag wait (gather + overlap path only) -----
             //
-            // All 128 producer-WG threads read tile_rank (L2 broadcast) and
-            // check s_rank_seen[r] via volatile smem read.
+            // All 128 producer-WG threads read tile_rank (L2 broadcast). For
+            // unique-rank tiles they check s_rank_seen[r] via volatile smem read.
+            // expert_srank_padding=false can produce mixed-rank tiles; those use a
+            // negative tile_rank sentinel and wait for every rank.
             //
             // Fast path (cached rank): volatile read sees 1 → skip.
             //   Cost: __ldg + volatile smem read + branch ≈ 0.1 us.
@@ -415,47 +422,55 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             //   Cost: 128 threads × ld.acquire.sys broadcast ≈ 1 us.
             //
             // See docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md §14.
-            if (has_rank_flags) {
-                const uint32_t r = static_cast<uint32_t>(__ldg(tile_rank + m_block_idx));
-                DG_TRAP_ONLY_DEVICE_ASSERT(r < num_ranks and r < kNumRanksMax);
-                if (*reinterpret_cast<volatile uint32_t*>(s_rank_seen + r) == 0) {
-                    while (deep_gemm::ptx::ld_acq_sys(rank_flags + r) < rank_flag_epoch) {
+            if constexpr (kHasRankFlags) {
+                auto wait_rank_ready = [&](const uint32_t r) {
+                    DG_TRAP_ONLY_DEVICE_ASSERT(r < num_ranks and r < kNumRanksMax);
+                    if (*reinterpret_cast<volatile uint32_t*>(s_rank_seen + r) == 0) {
+                        while (deep_gemm::ptx::ld_acq_sys(rank_flags + r) < rank_flag_epoch) {
+                        }
+                        if (warp_in_wg == 0 and cute::elect_one_sync()) {
+                            s_rank_seen[r] = 1;
+                        }
                     }
-                    if (warp_in_wg == 0 and cute::elect_one_sync()) {
-                        s_rank_seen[r] = 1;
+                };
+
+                const int tile_r = __ldg(tile_rank + m_block_idx);
+                if (tile_r >= 0) {
+                    wait_rank_ready(static_cast<uint32_t>(tile_r));
+                } else {
+                    #pragma unroll
+                    for (uint32_t r = 0; r < kNumRanksMax; ++ r) {
+                        if (r < num_ranks)
+                            wait_rank_ready(r);
                     }
                 }
             }
             // -----------------------------------------------------------------
 
-            uint32_t source_m_for_a[kAItersPerThread];
-            #pragma unroll
-            for (uint32_t i = 0; i < kAItersPerThread; ++i) {
-                const uint32_t linear = (i * kCpAsyncThreads + tid_in_wg) * kCpAsyncWidth;
-                const uint32_t row = linear / BLOCK_K;
-                const uint32_t logical_m = m_global_base + row;
-                if (logical_m >= shape_m) {
-                    source_m_for_a[i] = kPadSentinel;
-                } else if (has_gather_index) {
-                    const int g = __ldg(gather_index + logical_m);
-                    // Any negative value (host convention is `-1`) means "pad row".
-                    source_m_for_a[i] = (g < 0) ? kPadSentinel : static_cast<uint32_t>(g);
-                } else {
-                    source_m_for_a[i] = logical_m;
+            uint32_t source_m_for_a[kHasGatherIndex ? kAItersPerThread : 1];
+            uint32_t source_m_for_sfa[kHasGatherIndex ? kSFAItersPerThread : 1];
+            if constexpr (kHasGatherIndex) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kAItersPerThread; ++i) {
+                    const uint32_t row = i * kRowsPerAIter + tid_in_wg / kAThreadsPerRow;
+                    const uint32_t logical_m = m_global_base + row;
+                    if (logical_m >= shape_m) {
+                        source_m_for_a[i] = kPadSentinel;
+                    } else {
+                        const int g = __ldg(gather_index + logical_m);
+                        source_m_for_a[i] = (g < 0) ? kPadSentinel : static_cast<uint32_t>(g);
+                    }
                 }
-            }
-            uint32_t source_m_for_sfa[kSFAItersPerThread];
-            #pragma unroll
-            for (uint32_t i = 0; i < kSFAItersPerThread; ++i) {
-                const uint32_t row = i * kCpAsyncThreads + tid_in_wg;
-                const uint32_t logical_m = m_global_base + row;
-                if (row >= BLOCK_M or logical_m >= shape_m) {
-                    source_m_for_sfa[i] = kPadSentinel;
-                } else if (has_gather_index) {
-                    const int g = __ldg(gather_index + logical_m);
-                    source_m_for_sfa[i] = (g < 0) ? kPadSentinel : static_cast<uint32_t>(g);
-                } else {
-                    source_m_for_sfa[i] = logical_m;
+                #pragma unroll
+                for (uint32_t i = 0; i < kSFAItersPerThread; ++i) {
+                    const uint32_t row = i * kCpAsyncThreads + tid_in_wg;
+                    const uint32_t logical_m = m_global_base + row;
+                    if (row >= BLOCK_M or logical_m >= shape_m) {
+                        source_m_for_sfa[i] = kPadSentinel;
+                    } else {
+                        const int g = __ldg(gather_index + logical_m);
+                        source_m_for_sfa[i] = (g < 0) ? kPadSentinel : static_cast<uint32_t>(g);
+                    }
                 }
             }
 
@@ -507,24 +522,32 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 //   Over kAItersPerThread = BLOCK_M / 16 iters, rows [0, BLOCK_M) are covered
                 //   exactly once — verified for BLOCK_M ∈ {16, 32, 64, 128, 256}.
                 __nv_fp8_e4m3* dst_a = smem_a[stage_idx];
-                #pragma unroll
-                for (uint32_t i = 0; i < kAItersPerThread; ++i) {
-                    const uint32_t linear = (i * kCpAsyncThreads + tid_in_wg) * kCpAsyncWidth;
-                    const uint32_t row = linear / BLOCK_K;
-                    const uint32_t col = linear % BLOCK_K;
-                    // Pad-aware cp.async: when `source_m_for_a[i] == kPadSentinel` the row is
-                    // either out-of-shape_m or explicitly tagged by the host as pad
-                    // (`gather_index[i] < 0`). Pass `src_size = 0` to make HW zero-fill the
-                    // 16 B smem slot without dereferencing `src`. We still need a valid
-                    // (in-bounds) source pointer to satisfy the address generator, so we
-                    // fall back to `gmem_a` itself for pad rows.
-                    const bool is_pad = (source_m_for_a[i] == kPadSentinel);
-                    const uint32_t src_size = is_pad ? 0u : kCpAsyncWidth;
-                    const __nv_fp8_e4m3* src_a = is_pad
-                        ? gmem_a
-                        : gmem_a + source_m_for_a[i] * stride_a + k_idx + col;
-                    cp_async4_zfill(dst_a + row * BLOCK_K + (col ^ ((row % 8) * 16)),
-                                    src_a, src_size);
+                if constexpr (kHasGatherIndex) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kAItersPerThread; ++i) {
+                        const uint32_t row = i * kRowsPerAIter + tid_in_wg / kAThreadsPerRow;
+                        const uint32_t col = (tid_in_wg % kAThreadsPerRow) * kCpAsyncWidth;
+                        const uint32_t source_m = source_m_for_a[i];
+                        // Pad-aware cp.async: when `source_m == kPadSentinel` the row is
+                        // either out-of-shape_m or explicitly tagged by the host as pad. Pass
+                        // `src_size = 0` to make HW zero-fill the 16 B smem slot without
+                        // dereferencing `src`.
+                        const bool is_pad = (source_m == kPadSentinel);
+                        const uint32_t src_size = is_pad ? 0u : kCpAsyncWidth;
+                        const __nv_fp8_e4m3* src_a = is_pad
+                            ? gmem_a
+                            : gmem_a + source_m * stride_a + k_idx + col;
+                        cp_async4_zfill(dst_a + row * BLOCK_K + (col ^ ((row % 8) * 16)),
+                                        src_a, src_size);
+                    }
+                } else {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kAItersPerThread; ++i) {
+                        const uint32_t row = i * kRowsPerAIter + tid_in_wg / kAThreadsPerRow;
+                        const uint32_t col = (tid_in_wg % kAThreadsPerRow) * kCpAsyncWidth;
+                        cp_async4(dst_a + row * BLOCK_K + (col ^ ((row % 8) * 16)),
+                                  gmem_a + (m_global_base + row) * stride_a + k_idx + col);
+                    }
                 }
 
                 // (2b) Threads cooperatively load sfa rows; each thread may cover multiple
@@ -539,26 +562,47 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 //      Out-of-bound rows that are skipped still participate in
                 //      `cp.async.mbarrier.arrive.noinc` correctly: a thread with no
                 //      outstanding cp.async in this group resolves its arrive immediately.
-                #pragma unroll
-                for (uint32_t i = 0; i < kSFAItersPerThread; ++i) {
-                    const uint32_t row = i * kCpAsyncThreads + tid_in_wg;
-                    if (row < BLOCK_M) {
-                        const uint32_t sfa_k_idx = scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx);
-                        const bool is_pad_sfa = (source_m_for_sfa[i] == kPadSentinel);
-                        const uint32_t src_size_sfa = is_pad_sfa ? 0u : 4u;
-                        float* dst_sfa = smem_sfa[stage_idx] + row;
-                        // For pad rows, fall back to `gmem_sfa` as a known-valid source
-                        // pointer; HW won't dereference it because src_size = 0.
-                        const float* src_sfa = is_pad_sfa
-                            ? gmem_sfa
-                            : (sfa_is_mn_major
-                                ? gmem_sfa + sfa_k_idx * stride_sfa + source_m_for_sfa[i]
-                                : gmem_sfa + source_m_for_sfa[i] * stride_sfa + sfa_k_idx);
-                        asm volatile(
-                            "cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
-                            :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),
-                               "l"(reinterpret_cast<const void*>(src_sfa)),
-                               "r"(src_size_sfa));
+                if constexpr (kHasGatherIndex) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kSFAItersPerThread; ++i) {
+                        const uint32_t row = i * kCpAsyncThreads + tid_in_wg;
+                        if (row < BLOCK_M) {
+                            const uint32_t sfa_k_idx = scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx);
+                            const uint32_t source_m = source_m_for_sfa[i];
+                            const bool is_pad_sfa = (source_m == kPadSentinel);
+                            const uint32_t src_size_sfa = is_pad_sfa ? 0u : 4u;
+                            float* dst_sfa = smem_sfa[stage_idx] + row;
+                            // For pad rows, fall back to `gmem_sfa` as a known-valid source
+                            // pointer; HW won't dereference it because src_size = 0.
+                            const float* src_sfa = is_pad_sfa
+                                ? gmem_sfa
+                                : (kSFAIsMNMajor
+                                    ? gmem_sfa + sfa_k_idx * stride_sfa + source_m
+                                    : gmem_sfa + source_m * stride_sfa + sfa_k_idx);
+                            asm volatile(
+                                "cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
+                                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),
+                                   "l"(reinterpret_cast<const void*>(src_sfa)),
+                                   "r"(src_size_sfa));
+                        }
+                    }
+                } else {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kSFAItersPerThread; ++i) {
+                        const uint32_t row = i * kCpAsyncThreads + tid_in_wg;
+                        if (row < BLOCK_M and m_global_base + row < shape_m) {
+                            const uint32_t sfa_k_idx = scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx);
+                            const uint32_t source_m = m_global_base + row;
+                            float* dst_sfa = smem_sfa[stage_idx] + row;
+                            const float* src_sfa = kSFAIsMNMajor
+                                ? gmem_sfa + sfa_k_idx * stride_sfa + source_m
+                                : gmem_sfa + source_m * stride_sfa + sfa_k_idx;
+                            asm volatile(
+                                "cp.async.ca.shared.global [%0], [%1], %2;\n"
+                                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_sfa))),
+                                   "l"(reinterpret_cast<const void*>(src_sfa)),
+                                   "n"(4));
+                        }
                     }
                 }
 

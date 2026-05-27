@@ -30,12 +30,12 @@ public:
         uint32_t stride_a;    // row stride of A in fp8 elements
         void *gmem_sfa;
         uint32_t stride_sfa;  // MN-major: K-scale stride; raw row-major: row stride
-        bool sfa_is_mn_major;
+        bool sfa_is_mn_major; // compile-time specialization selector
         void *gather_index;   // optional int32 row remap for A/sfa; nullptr keeps logical rows
         // Per-rank ready-flag overlap (optional): set all three together. See
         // docs/sm90_fp8_gemm_1d2d_gather_index_rank_overlap.md for the contract.
         void *rank_flags;     // (num_ranks,) int64 on device; nullptr disables overlap
-        void *tile_rank;      // (ceil(m/BLOCK_M),) int32 on device; nullptr disables overlap
+        void *tile_rank;      // (ceil(m/BLOCK_M),) int32; negative means wait all ranks
         uint32_t num_ranks;   // <= 8 (kNumRanksMax in kernel); 0 when overlap is off
         uint64_t rank_flag_epoch; // monotonic epoch; kernel spins until rank_flags[r] >= epoch
         // Optional combine-scatter experiment: instead of TMA-storing D[M, N],
@@ -70,6 +70,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {}, {}, {},
         {},
         {}
     >);
@@ -87,6 +88,9 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
+        args.sfa_is_mn_major,
+        args.gather_index != nullptr,
+        args.rank_flags != nullptr,
         args.combine_row_topk != nullptr,
         get_default_epilogue_type(args.epilogue_type));
     }
@@ -97,7 +101,7 @@ static void __instantiate_kernel() {{
             args.sfb, args.grouped_layout,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.gmem_a, args.stride_a,
-            args.gmem_sfa, args.stride_sfa, args.sfa_is_mn_major,
+            args.gmem_sfa, args.stride_sfa,
             args.gather_index,
             args.rank_flags, args.tile_rank, args.num_ranks, args.rank_flag_epoch,
             args.combine_row_topk, args.combine_topk_scores, args.combine_buffer_ptrs,
@@ -347,7 +351,8 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     }
     const uint32_t stride_a_elems = static_cast<uint32_t>(a.stride(0));
     const bool sfa_is_mn_major = not has_overlap;
-    const uint32_t stride_sfa_elems = static_cast<uint32_t>(sfa.stride(-1));
+    const uint32_t stride_sfa_elems = static_cast<uint32_t>(
+        sfa_is_mn_major ? sfa.stride(-1) : sfa.stride(-2));
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,

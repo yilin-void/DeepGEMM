@@ -92,10 +92,12 @@ rank_of_source(g) = g / T          // 整数除
 
 `tile_rank` 的约定（**新增**）：
 
-- `tile_rank[m_block_idx]` 是这 tile 所依赖的 **唯一** rank。
+- `tile_rank[m_block_idx] >= 0`：这 tile 所依赖的 **唯一** rank。
 - 对应 host 端构造保证：tile 内所有非 pad 行，
 `gather_index[i] / T == tile_rank[m_block_idx]`。
-- 这是 host 端的 invariant；kernel 只信任不验证（debug build 可加 trap）。
+- `tile_rank[m_block_idx] < 0`：mixed/unknown rank tile。这个情况会在
+`expert_srank_padding=False` 时出现；kernel 保守等待所有 rank flags。
+- 这是 host 端的 invariant；kernel 只验证非负值是否越界。
 
 ### 2.3 同步契约
 
@@ -890,8 +892,9 @@ deep_gemm.fp8_gemm_nt(
 | 传了 `rank_flags` 但 `gather_index = None` | host 校验失败（这是 misuse）                                                                    |
 | 某 rank 始终未发 flag                        | spin 直到超时；建议 host 侧加 watchdog 或在 kernel 里加 cycle 计数后 trap（参考 `nvlink_barrier` 的 30s 超时） |
 | `gather_index[i] < 0` 而 `i < shape_m`   | pad 行，A/sfa cp.async src_size=0；output 写 0                                              |
-| `tile_rank[mb]` 越界（`>= num_ranks`）      | UB，host 必须保证。建议 host 用 `assert` 兜底                                                      |
-| tile 内全部是 pad（不该出现）                     | 仍会 spin 当前 tile_rank 对应的 flag；如果 flag 永远不会到，挂死。host 不应该调度这种 tile                        |
+| `tile_rank[mb]` 越界（非负且 `>= num_ranks`） | trap；host 必须保证。建议 host 用 `assert` 兜底                                                      |
+| `tile_rank[mb] < 0`                       | mixed/unknown rank tile，kernel 保守等待所有 rank flags                                             |
+| tile 内全部是 pad（不该出现）                     | `tile_rank >= 0` 时 spin 当前 rank；`tile_rank < 0` 时等待所有 rank。host 不应该调度这种 tile                    |
 | `num_ranks = 1`                         | 退化：每 tile spin 同一个 flag（且只 spin 一次因 cache），相当于一次性等 all-gather 完成                        |
 
 
@@ -2015,4 +2018,3 @@ overlap bench 预期从 `speedup=1.046x` 提升至 ~1.10–1.12x。
 `deep_gemm/include/deep_gemm/comm/barrier.cuh` 中的 `nvlink_barrier`
 - system-scope load 原语：
 `deep_gemm/include/deep_gemm/ptx/ld_st.cuh` 的 `ld_acq_sys`
-
