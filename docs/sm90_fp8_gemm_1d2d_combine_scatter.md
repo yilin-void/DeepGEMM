@@ -144,6 +144,7 @@ combine_row_topk:         Optional[Tensor[int32]]
 combine_buffer_ptrs:      Optional[Tensor[int64]]
 combine_tokens_per_rank:  Optional[int]
 combine_top_k:            Optional[int]
+combine_scatter_direct_accum_stg: bool = false
 ```
 
 当 `combine_row_topk` 非空时，GEMM 进入 combine-scatter epilogue；否则保持原有
@@ -272,13 +273,9 @@ allocator 的 base allocation offset：IPC handle 对应的是 allocation base�
 writer rank 通过自己的 IPC mapping 读写会自洽，但 owner rank 用本地 tensor 指针做
 local reduction 时会看不到 remote slot。
 
-### 4.3 为什么先写 shared memory
+### 4.3 两种 scatter epilogue
 
-最早的直接实现是从 accumulator lane 里取 BF16x2，然后每次发一个小的 global
-store。这个版本可以工作，但 store 粒度太小，peer store 数量太多，性能很差。
-后续曾经把它做成模板参数重新实测，结果仍然明显退化，因此相关代码已经撤回。
-
-当前实现改成两步：
+默认 scatter epilogue 仍保留 staged 路径：
 
 1. 用 STSM 把 WGMMA accumulator fragment 落到 row-major shared-memory tile。
 2. 所有 store threads 从 shared memory 读出连续 16B chunk，用 `uint4` 写到目标
@@ -319,6 +316,21 @@ for (uint32_t elem = 0; elem < 8; ++elem)
 
 当 `shape_n` 尾部不足 8 个 BF16 时，会退化成 element-wise tail store。不过 host
 侧当前要求 `N % 8 == 0`，正常 benchmark 不会走 tail。
+
+N32 direct epilogue 由 `combine_scatter_direct_accum_stg=true` 打开。它要求调用侧
+在 FP8 cast 之前按每 32 个 N 做一次 B 重排，使 WGMMA accumulator owner lanes 在
+同一条 store 指令里写相邻 16B segment：
+
+```text
+lane0 -> n +  0 .. n +  7
+lane1 -> n +  8 .. n + 15
+lane2 -> n + 16 .. n + 23
+lane3 -> n + 24 .. n + 31
+```
+
+benchmark 中该重排由 `_make_wgmma_n32_physical_to_logical_index` 完成。N32 direct
+path 直接把 accumulator pack 成 8 个 BF16，并用 `st.global.v4.u32` 写到 peer
+combine buffer，跳过 STSM 和 shared-memory reload。
 
 ### 4.4 与原 TMA store 路径的关系
 
@@ -484,6 +496,8 @@ tests/bench_combine_scatter.py
 --bench-standalone-scatter    # 同时跑 standalone scatter-copy 和 two-stage baseline
 --bench-reduce-scatter        # 同时跑 GEMM + pack/local-reduce + NCCL reduce-scatter baseline
 --no-gather-a                 # GEMM2-style：A/SFA 已按 grouped row 连续排布
+--combine-scatter-direct-accum-stg
+                              # 使用 N32 B 重排 + direct accumulator STG epilogue
 --scatter-rows-per-block      # standalone scatter-copy 的 rows/CTA，默认 4
 --compact-layout-order        # compact GEMM2 row order：token 或 ring，默认 token
 ```
@@ -547,7 +561,7 @@ hidden           = 1280   # GEMM K, fc2 input/intermediate dimension
 n                = 2048   # GEMM N, fc2 output/hidden dimension
 ```
 
-主要命令：
+默认 staged epilogue 命令：
 
 ```bash
 NCCL_MIN_CTAS=64 NCCL_MAX_CTAS=64 \
@@ -560,16 +574,36 @@ python3 tests/bench_combine_scatter.py \
   --global-num-experts 512 \
   --experts-per-rank-token 2 \
   --no-gather-a \
-  --bench-standalone-scatter \
-  --bench-reduce-scatter \
-  --warmups 10 \
-  --iters 20
+  --warmups 2 \
+  --iters 5
+```
+
+N32 direct-accumulator epilogue 命令：
+
+```bash
+NCCL_MIN_CTAS=64 NCCL_MAX_CTAS=64 \
+python3 tests/bench_combine_scatter.py \
+  --num-local-ranks 8 \
+  --tokens-per-rank 6976 \
+  --hidden 1280 \
+  --n 2048 \
+  --top-k 16 \
+  --global-num-experts 512 \
+  --experts-per-rank-token 2 \
+  --no-gather-a \
+  --combine-scatter-direct-accum-stg \
+  --warmups 2 \
+  --iters 5
 ```
 
 log：
 
 ```text
-外层 workspace/logs/bench_compact_gemm2_latest_h200.log
+workspace/logs/bench_scatter_compare_target_h200_20260527_002404.log
+workspace/logs/bench_direct_n32_permuted_b_target_h200_20260527_004037.log
+workspace/logs/bench_direct_n32_permuted_b_target_check_h200_20260527_004125.log
+workspace/logs/bench_cleanup_n32_target_h200_20260527_005346.log
+workspace/logs/bench_cleanup_n32_small_check_h200_20260527_005311.log
 ```
 
 ### 6.2 结果
@@ -591,20 +625,10 @@ layout = compact-gemm2/token
 结果按方案拆分如下。表里 `total` 是直接测整条路径的 median，不是把各组件 median
 简单相加。
 
-| 方案 | 组件 | 时间 |
-| --- | --- | ---: |
-| common | GEMM no scatter | 779.00 us (event 735.62 us) |
-| fused scatter | fused GEMM + raw scatter | 1633.01 us (event 1580.45 us) |
-| two-stage scatter-copy | GEMM no scatter | 779.00 us (event 735.62 us) |
-| two-stage scatter-copy | raw scatter-copy | 1264.02 us (event 1186.74 us, 385.24 GB/s) |
-| two-stage scatter-copy | total GEMM + scatter-copy | 1997.72 us (event 1918.06 us) |
-| reduce-scatter baseline | GEMM no scatter | 779.00 us (event 735.62 us) |
-| reduce-scatter baseline | pack/local-reduce | 1303.24 us (event 1227.70 us) |
-| reduce-scatter baseline | NCCL reduce-scatter SUM | 1201.19 us (event 1157.57 us, alg-bw 345.58 GB/s) |
-| reduce-scatter baseline | total GEMM + pack + RS | 3132.18 us |
-| fused scatter + local reduction | fused GEMM + raw scatter | 1633.01 us (event 1580.45 us) |
-| fused scatter + local reduction | scored local reduction | 250.26 us (event 177.70 us) |
-| fused scatter + local reduction | total fused + local reduction | 1839.50 us |
+| 方案 | GEMM no scatter | fused GEMM + raw scatter | local reduction | total fused + local reduction |
+| --- | ---: | ---: | ---: | ---: |
+| staged epilogue：STSM + smem reload + 16B peer STG | 783.89 us (event 732.29 us) | 1643.71 us (event 1587.74 us) | 206.62 us (event 164.38 us) | 1841.87 us |
+| N32 direct accumulator STG | 781.00 us (event 732.58 us) | 1545.07 us (event 1492.58 us) | 205.77 us (event 163.07 us) | 1781.66 us |
 
 correctness：
 
@@ -615,68 +639,36 @@ mismatches   = 0
 
 CPU reference check for fused scatter + local reduction:
 max_abs_diff = 9.15527e-05
-tokens       = 16
+tokens       = 4
 mismatches   = 0
-```
-
-standalone scatter-copy 写入数据量：
-
-```text
-tokens_per_rank * top_k * n * sizeof(bf16)
-= 6976 * 16 * 2048 * 2
-= 457,179,136 bytes
-```
-
-对应带宽：
-
-```text
-457.2 MB / 1.18674 ms = 385.24 GB/s
 ```
 
 ### 6.3 解读
 
-以 two-stage 为 baseline：
+N32 direct epilogue 相比 staged epilogue：
 
 ```text
-two-stage event       ≈ 1918 us
-fused combine-scatter ≈ 1580 us
+fused GEMM + raw scatter:
+  staged  = 1643.71 us wall / 1587.74 us event
+  N32 dir = 1545.07 us wall / 1492.58 us event
 ```
 
-fused epilogue 省掉约 `338 us`，约 `1.21x`。这说明 fused 路径确实把独立
-scatter-copy 的大部分成本藏进了 GEMM epilogue，而不是简单地把通信原样追加到
-GEMM 后面。
+N32 direct epilogue 省掉约 `99 us` wall / `95 us` event。它证明绕开
+`accumulator -> STSM -> shared memory reload` 这条路径有收益，但收益不是数量级变化。
 
-如果看完整 combine 对比：
+与不做 scatter 的 GEMM 相比，N32 direct 仍然有明显额外成本：
 
 ```text
-GEMM + pack/local-reduce + reduce-scatter ≈ 3132 us
-fused combine-scatter + local reduction   ≈ 1840 us
+GEMM no scatter       ≈ 781 us wall / 733 us event
+N32 fused raw scatter ≈ 1545 us wall / 1493 us event
+extra                 ≈ 764 us wall / 760 us event
 ```
 
-当前 fused 路径快约 `1.70x`。不过这个结论要谨慎解读：reduce-scatter baseline
-里的 pack/local-reduce kernel 目前是朴素 atomic 实现，单独就要约 `1228 us` event；
-NCCL reduce-scatter 本身约 `1158 us` event。因此这条 baseline 现在更多用于建立数学等价
-验证和性能参照，不能代表充分优化后的 reduce-scatter 方案上限。
+score multiply 已经移到 local reduction；local reduction 在这组测试里约
+`164 us` event，并没有随 epilogue 形态明显变化。因此当前主要剩余瓶颈仍在
+raw scatter epilogue 的 peer write 路径，而不是 score/reduction。
 
-但 fused 仍然显著慢于“不做 scatter 的 GEMM”。同形状不带 combine-scatter 的历史
-baseline 为：
-
-```text
-GEMM without scatter ≈ 1470.81 us
-```
-
-GEMM2-style no-gather A、target shape 的当前 baseline 为：
-
-```text
-GEMM without scatter ≈ 779.00 us
-```
-
-因此当前 fused epilogue 仍然额外引入约 `854 us` wall time，或约 `845 us` event。
-score multiply 已经移到 local reduction，fused epilogue 的额外成本主要来自
-`accumulator -> shared memory -> 16B peer store` 这条写回路径以及 remote store 本身。
-
-local reduction 优化把 scored reduction 从旧实现的约 `422.82 us`
-wall / `381.58 us` event 降到约 `250.26 us` wall / `177.70 us` event。优化来自
+local reduction 的第一轮优化来自
 按 token 和 N tile 分块、模板化 `top_k`、把 score 缓存在 shared memory，并移除
 per-element 的除法/取模。
 
@@ -757,89 +749,77 @@ workspace/logs/bench_compact_token_order_h200.log
 workspace/logs/bench_compact_ring_order_h200.log
 ```
 
-### 6.5 诊断实验结论
+### 6.5 N32 direct-store 诊断结论
 
-为了定位融合 scatter 的额外开销，曾经在 score multiply 合入之前做过几组一次性
-诊断实验。这些诊断开关已经从正式 benchmark 中移除，但结果对后续优化仍有参考价值。
+direct accumulator store 的关键不是“每个 lane 自己连续”，而是同一条 warp store
+指令里相邻 lane 写相邻的 16B segment。
 
-| 诊断路径 | 结果 | 结论 |
-| --- | ---: | --- |
-| `null dst`：走 STSM + scatter loop，但不发 global store | 1783.55 us | 仅 epilogue 改写本身已经比 no-scatter GEMM 慢约 319 us |
-| `local dst`：scatter 到本地 HBM | 1850.44 us | local HBM store 只比 null 多几十 us |
-| `peer dst`：scatter 到 peer combine buffer | 约 2.1 ms | peer store 额外增加约 200-300 us |
-| `row-major peer dst`：目标按 logical row 连续排布 | 2069.01 us | final slot 的跨行不连续不是主瓶颈 |
+撤回的 N128 重排让每个 lane 自己写连续 8 个 BF16，但同一轮 store 中 lanes 0..3
+写的是：
 
-结论：
+```text
+lane0 -> 0..7
+lane1 -> 32..39
+lane2 -> 64..71
+lane3 -> 96..103
+```
 
-- 当前主要瓶颈不是 final slot 地址不连续。
-- 也不是 standalone peer bandwidth 本身完全暴露，因为 fused 已经比 two-stage 快很多。
-- 更大的成本来自当前 epilogue 结构：`accumulator -> shared memory -> 16B STG`
-  这条路径引入了额外 STSM、barrier、shared-memory read 和 scatter loop。
+这对 peer store 极差。当前保留的 N32 重排改成：
+
+```text
+lane0 -> 0..7
+lane1 -> 8..15
+lane2 -> 16..23
+lane3 -> 24..31
+```
+
+B 的 N32 physical-to-logical 映射为：
+
+```text
+physical = pair * 8 + lane_group * 2 + elem
+logical  = lane_group * 8 + pair * 2 + elem
+```
+
+代码侧对应：
+
+```c++
+logical_col = n_block_idx * 128 + vec * 32 + (lane_idx & 3) * 8;
+accum_pair_base = vec * 4;
+```
+
+同一正常 H200 节点上的目标 shape 结果：
+
+| 路径 | fused GEMM + raw scatter | local reduction | total |
+| --- | ---: | ---: | ---: |
+| staged peer scatter | 1643.71 us (event 1587.74 us) | 206.62 us (event 164.38 us) | 1841.87 us |
+| N128 direct peer scatter（已撤回） | 4626.54 us (event 4591.52 us) | 206.60 us (event 163.52 us) | 4837.86 us |
+| N32 direct peer scatter（当前保留） | 1545.07 us (event 1492.58 us) | 205.77 us (event 163.07 us) | 1781.66 us |
+
+另一个一次性 local-store 诊断把 peer pointer table 临时替换为本地 buffer，结果为
+`851.18 us wall / 806.53 us event`。这个诊断路径已经从代码中移除；它只说明
+N32 direct epilogue 的本地写回开销已经接近 no-scatter GEMM，当前大头仍是 peer
+store。
 
 ### 6.6 已撤回的失败尝试
 
-为了确认是否能避开当前 `STSM -> smem reload -> 16B peer STG` 路径，做过两类实验：
+以下实验代码已经移除，不再作为 benchmark 或 API surface 保留：
 
-1. **direct accumulator BF16x2 peer store**
+1. **store warpgroup prototype**
 
-   在 combine-scatter epilogue 中跳过 row-major shared-memory staging，直接由
-   WGMMA accumulator owner lanes 把 BF16x2 写到 peer combine buffer。
+   额外启动一个 warpgroup 专门做 `STSM -> LDS -> peer STG`。该原型增加了线程数、
+   barrier 协作和寄存器分配复杂度，未形成可验证的稳定收益，因此撤回。
 
-2. **row-major peer TMA store**
+2. **N128 direct accumulator store**
 
-   重新加回 rank-padded layout，让每个 M tile 只对应一个 source rank，然后用 TMA
-   写一个 row-major peer intermediate buffer。该实验分两种：
+   该版本试图通过每 128 列 B 重排让每个 lane 的 accumulator 在 N 方向连续。
+   结果每个 lane 内部连续，但跨 lane store 地址稀疏，peer store 退化严重。
+   它已被 N32 direct store 替代。
 
-   - fixed-peer：所有 tile 都写到固定的 `(rank + 1) % world_size` peer buffer。
-   - tile-rank：按 `tile_rank[m_tile]` 选择 source rank 的 peer buffer，并用
-     writer-rank slice 避免多个 writer 写同一位置。
+3. **row-major peer TMA / fixed-peer STG**
 
-这些实验均未保留在代码中。它们只用于判断性能上限，不是最终 combine 语义的一部分。
-
-目标 shape：
-
-```text
-ranks=8
-global tokens=55808
-tokens/rank=6976
-local_top_k=2
-global_top_k=16
-hidden=1280
-N=2048
-rank-padded m_logical=131328
-```
-
-H200 结果：
-
-| 路径 | wall median | event median | 结论 |
-| --- | ---: | ---: | --- |
-| no-scatter GEMM | 863.96 us | 841.38 us | 同一轮实验的纯 GEMM 参考 |
-| current fused scatter：STSM + 16B peer STG | 1641.49 us | 1574.59 us | 当前保留路径 |
-| direct BF16x2 peer store | 2892.12 us | 2840.29 us | 明显更慢，store 粒度过小 |
-| fixed-peer row-major TMA store | 1567.83 us | 1521.94 us | 不是 final combine 语义，仅比当前 fused 略快 |
-| fixed-peer row-major STG store | 1583.97 us | 1538.16 us | 和 fixed-peer TMA 接近 |
-| tile-rank row-major TMA store | 1571.69 us | 1511.01 us | 动态按 tile 选 peer descriptor 不是主要额外开销 |
-
-分析：
-
-- direct BF16x2 store 虽然省掉 STSM、barrier 和 smem reload，但把 16B 合并写退化成大量
-  4B peer writes，peer store 指令数量和合并效率都很差，因此不值得保留。
-- TMA 只能很好地描述规则 row-major intermediate，不能直接表达最终
-  `combine_buffer[token, topk_slot, n]` 的 per-row 动态目标地址。
-- 即使在 row-major intermediate 这个更有利的 upper-bound 实验里，TMA store 仍然在
-  `~1.5 ms event`，相比 no-scatter GEMM 仍多约 `670 us`。它没有把主要差距消掉。
-- fixed-peer TMA、fixed-peer STG、tile-rank TMA 三者接近，说明动态选择 peer descriptor
-  不是主要问题；主要成本仍来自 epilogue 写回结构和 remote write 本身。
-- 因此当前代码保持单一路径：`STSM -> 16B vector peer STG -> local reduction`。
-  direct-store 和 tile-rank TMA 实验代码均撤回，只在文档中保留结论。
-
-相关 log：
-
-```text
-workspace/logs/bench_direct_store_core_h200.log
-workspace/logs/bench_tile_rank_tma_h200.log
-workspace/logs/bench_tile_rank_tma_check_h200.log
-```
+   这类实验需要把最终 combine 语义改成 row-major intermediate，无法直接表达
+   `combine_buffer[token, topk_slot, n]` 的 per-row 动态目标地址。它们只能作为
+   upper-bound 诊断，不适合作为当前实现方向，因此相关代码不再保留。
 
 ---
 
@@ -860,24 +840,24 @@ out[token, :] += combine_buffer[token, topk_slot, :] * topk_scores[token, topk_s
 ```
 
 因此当前已经覆盖 fc2 输出的 remote scatter 和 source-rank local combine。第一轮优化后，
-local reduction 在目标 shape 上约为 `178 us` event，但 scatter 和 reduction 仍然是两个
+local reduction 在目标 shape 上约为 `164 us` event，但 scatter 和 reduction 仍然是两个
 kernel，中间通过 BF16 combine buffer 连接。
 
 ### 7.2 可能的优化方向
 
 后续优化应优先围绕 epilogue 结构，而不是继续调 grid/block：
 
-1. **减少 accumulator -> smem -> gmem 的额外路径成本**
+1. **继续优化 N32 direct peer store**
 
-   当前 vectorized store 需要先把 accumulator fragment 落到 row-major shared
-   memory。诊断显示这部分本身已经很贵。需要探索是否能在不退回 BF16x2 小 store
-   的情况下减少 staging/barrier 成本。
+   N32 direct epilogue 已经绕过 `STSM -> smem reload`，但相比 no-scatter GEMM
+   仍多约 `760 us` event。下一步应关注 peer store 本身的吞吐、store issue 形态、
+   L2/NVLink 写合并，以及是否能减少每 row 的 pointer/base 读取成本。
 
 2. **继续优化 remote store 路径，而不是优先调整 compact row order**
 
    `--compact-layout-order ring` 只带来噪声级改善，说明 source-rank row order 不是当前
    fused scatter 的主瓶颈。后续应继续关注 peer-store 指令形态、store 粒度、写入合并
-   以及 epilogue 内等待和 barrier 的成本。
+   以及 epilogue 内等待和同步成本。
 
 3. **暂不优先推进 row-major TMA intermediate**
 
