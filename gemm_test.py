@@ -11,7 +11,7 @@ import torch
 sys.path.insert(0, os.getcwd())
 sys.path.insert(0, os.path.join(os.getcwd(), "tests"))
 
-import deep_gemm
+import deep_gemm_moe_L1
 from generators import (
     MajorTypeAB,
     QuantConfig,
@@ -198,7 +198,7 @@ def main() -> None:
     routing_topk = torch.topk(scores, args.top_k, dim=1).indices.to(torch.int32)
 
     gather_index, tile_rank, grouped_layout, m_logical_t, psum_layout, _row_to_topk = (
-        deep_gemm.build_gather_layout_for_rank_overlap(
+        deep_gemm_moe_L1.build_gather_layout_for_rank_overlap(
             routing_topk,
             args.local_rank,
             args.num_ranks,
@@ -270,7 +270,7 @@ def main() -> None:
                 num_ranks=args.num_ranks,
                 rank_flag_epoch=1,
             )
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+        deep_gemm_moe_L1.m_grouped_fp8_gemm_nt_contiguous(
             (a_data, sfa),
             b,
             output,
@@ -286,7 +286,7 @@ def main() -> None:
         )
 
     def launch_plain(a_plain, output: torch.Tensor) -> None:
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+        deep_gemm_moe_L1.m_grouped_fp8_gemm_nt_contiguous(
             a_plain,
             b,
             output,
