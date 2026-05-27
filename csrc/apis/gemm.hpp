@@ -201,6 +201,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  const std::optional<torch::Tensor>& combine_buffer_ptrs = std::nullopt,
                                                  const std::optional<int>& combine_tokens_per_rank = std::nullopt,
                                                  const std::optional<int>& combine_top_k = std::nullopt,
+                                                 const bool& combine_scatter_direct_accum_stg = false,
                                                  const bool& use_tma_store = true,
                                                  const std::optional<int64_t>& tma_store_ptr_override = std::nullopt) {
     // Shape must be `[M, K] @ [G, N, K].mT`
@@ -248,11 +249,14 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         DG_HOST_ASSERT(effective_combine_src_index->is_cuda() and effective_combine_src_index->is_contiguous());
         DG_HOST_ASSERT(effective_combine_src_index->scalar_type() == torch::kInt);
         DG_HOST_ASSERT(effective_combine_src_index->numel() >= m_d);
+        if (combine_scatter_direct_accum_stg)
+            DG_HOST_ASSERT(n % 32 == 0 and "direct combine-scatter requires N32-permuted B");
     } else {
         DG_HOST_ASSERT(not combine_src_index.has_value());
         DG_HOST_ASSERT(not combine_buffer_ptrs.has_value());
         DG_HOST_ASSERT(not combine_tokens_per_rank.has_value());
         DG_HOST_ASSERT(not combine_top_k.has_value());
+        DG_HOST_ASSERT(not combine_scatter_direct_accum_stg);
     }
     const int m_pool = m_a;
     const int m = m_d;
@@ -316,6 +320,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                 has_combine_scatter ? effective_combine_src_index : empty_combine_src_index,
                                                 combine_row_topk, combine_buffer_ptrs,
                                                 combine_tokens_per_rank, combine_top_k,
+                                                has_combine_scatter and combine_scatter_direct_accum_stg,
                                                 effective_use_tma_store,
                                                 tma_store_ptr_override);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
@@ -772,6 +777,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("combine_buffer_ptrs") = std::nullopt,
           py::arg("combine_tokens_per_rank") = std::nullopt,
           py::arg("combine_top_k") = std::nullopt,
+          py::arg("combine_scatter_direct_accum_stg") = false,
           py::arg("use_tma_store") = true,
           py::arg("tma_store_ptr_override") = std::nullopt);
     m.def("m_grouped_fp8_fp4_gemm_nn_contiguous", &m_grouped_fp8_fp4_gemm_nn_contiguous,

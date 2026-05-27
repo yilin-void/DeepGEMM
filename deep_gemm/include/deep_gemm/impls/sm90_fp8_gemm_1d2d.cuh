@@ -160,6 +160,7 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumSMs, GemmType kGemmType,
           bool kSFAIsMNMajor, bool kHasGatherIndex, bool kHasRankFlags,
           bool kCombineScatter,
+          bool kCombineScatterDirectAccumStg,
           bool kUseTMAStore,
           typename epilogue_type_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
@@ -818,6 +819,87 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 continue;
 
             if constexpr (kCombineScatter) {
+                if constexpr (kCombineScatterDirectAccumStg) {
+                    // N32 direct epilogue path. With B permuted inside each
+                    // 32-wide N chunk, lanes 0..3 write adjacent 16B segments
+                    // and avoid staging the tile through shared memory.
+                    constexpr uint32_t kScatterVecElems = 8;
+                    DG_STATIC_ASSERT(BLOCK_N == 128, "Direct accumulator stores require 128-wide N tiles");
+                    DG_STATIC_ASSERT(BLOCK_N % kScatterVecElems == 0, "Invalid vectorized scatter store shape");
+                    constexpr uint32_t kDirectStoreGroupCols = 32;
+                    constexpr uint32_t kDirectVecsPerRow = BLOCK_N / kDirectStoreGroupCols;
+
+                    auto store_vec_direct = [&](nv_bfloat16* dst_base,
+                                                const float* shifted_accum,
+                                                uint32_t row_accum_offset,
+                                                uint32_t accum_pair_base,
+                                                uint32_t logical_col) {
+                        if (dst_base == nullptr or logical_col >= shape_n)
+                            return;
+
+                        nv_bfloat162 packed_0 = __float22bfloat162_rn({
+                            shifted_accum[(accum_pair_base + 0) * 4 + row_accum_offset + 0],
+                            shifted_accum[(accum_pair_base + 0) * 4 + row_accum_offset + 1]});
+                        nv_bfloat162 packed_1 = __float22bfloat162_rn({
+                            shifted_accum[(accum_pair_base + 1) * 4 + row_accum_offset + 0],
+                            shifted_accum[(accum_pair_base + 1) * 4 + row_accum_offset + 1]});
+                        nv_bfloat162 packed_2 = __float22bfloat162_rn({
+                            shifted_accum[(accum_pair_base + 2) * 4 + row_accum_offset + 0],
+                            shifted_accum[(accum_pair_base + 2) * 4 + row_accum_offset + 1]});
+                        nv_bfloat162 packed_3 = __float22bfloat162_rn({
+                            shifted_accum[(accum_pair_base + 3) * 4 + row_accum_offset + 0],
+                            shifted_accum[(accum_pair_base + 3) * 4 + row_accum_offset + 1]});
+                        const uint32_t packed_u32_0 = *reinterpret_cast<uint32_t*>(&packed_0);
+                        const uint32_t packed_u32_1 = *reinterpret_cast<uint32_t*>(&packed_1);
+                        const uint32_t packed_u32_2 = *reinterpret_cast<uint32_t*>(&packed_2);
+                        const uint32_t packed_u32_3 = *reinterpret_cast<uint32_t*>(&packed_3);
+                        const uint32_t dst_col = epilogue_type_t::template apply_index_n<kScatterVecElems>(logical_col);
+                        if (logical_col + kScatterVecElems <= shape_n) {
+                            asm volatile(
+                                "st.global.v4.u32 [%0], {%1, %2, %3, %4};\n"
+                                :: "l"(dst_base + dst_col),
+                                   "r"(packed_u32_0), "r"(packed_u32_1),
+                                   "r"(packed_u32_2), "r"(packed_u32_3)
+                                : "memory");
+                        } else {
+                            auto* dst = dst_base + dst_col;
+                            auto* packed_bf16 = reinterpret_cast<nv_bfloat16*>(&packed_0);
+                            if (logical_col + 0 < shape_n) dst[0] = packed_bf16[0];
+                            if (logical_col + 1 < shape_n) dst[1] = packed_bf16[1];
+                            packed_bf16 = reinterpret_cast<nv_bfloat16*>(&packed_1);
+                            if (logical_col + 2 < shape_n) dst[2] = packed_bf16[0];
+                            if (logical_col + 3 < shape_n) dst[3] = packed_bf16[1];
+                            packed_bf16 = reinterpret_cast<nv_bfloat16*>(&packed_2);
+                            if (logical_col + 4 < shape_n) dst[4] = packed_bf16[0];
+                            if (logical_col + 5 < shape_n) dst[5] = packed_bf16[1];
+                            packed_bf16 = reinterpret_cast<nv_bfloat16*>(&packed_3);
+                            if (logical_col + 6 < shape_n) dst[6] = packed_bf16[0];
+                            if (logical_col + 7 < shape_n) dst[7] = packed_bf16[1];
+                        }
+                    };
+
+                    const uint32_t lane_col_offset = (lane_idx & 3u) * kScatterVecElems;
+                    #pragma unroll
+                    for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++local_idx) {
+                        const uint32_t m_offset = local_idx * WAVE_BLOCK_M;
+                        const uint32_t row_0 = m_offset + r_0;
+                        const uint32_t row_1 = row_0 + 8;
+                        const auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
+                        nv_bfloat16* dst_base_0 = reinterpret_cast<nv_bfloat16*>(s_combine_scatter_base[row_0]);
+                        nv_bfloat16* dst_base_1 = reinterpret_cast<nv_bfloat16*>(s_combine_scatter_base[row_1]);
+
+                        #pragma unroll
+                        for (uint32_t vec = 0; vec < kDirectVecsPerRow; ++vec) {
+                            const uint32_t logical_col =
+                                n_block_idx * BLOCK_N + vec * kDirectStoreGroupCols + lane_col_offset;
+                            const uint32_t accum_pair_base = vec * (kScatterVecElems / 2);
+                            store_vec_direct(dst_base_0, shifted_accum, 0, accum_pair_base, logical_col);
+                            store_vec_direct(dst_base_1, shifted_accum, 2, accum_pair_base, logical_col);
+                        }
+                    }
+                    continue;
+                }
+
                 // Stage the WGMMA fragment into a row-major shared-memory tile first.
                 // Direct BF16x2 peer stores from accumulator lanes are easy to wire up,
                 // but they issue many small global stores. The row-major staging below

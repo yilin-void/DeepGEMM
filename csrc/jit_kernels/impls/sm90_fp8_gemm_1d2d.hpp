@@ -48,6 +48,7 @@ public:
         uint32_t combine_top_k;
         void *gmem_d;
         uint32_t stride_d;
+        bool combine_scatter_direct_accum_stg;
         bool use_tma_store;
         // TMA descriptors kept for reference (A/sfa currently unused in kernel)
         CUtensorMap tensor_map_a;
@@ -76,6 +77,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -96,6 +98,7 @@ static void __instantiate_kernel() {{
         args.gather_index != nullptr,
         args.rank_flags != nullptr,
         args.combine_row_topk != nullptr,
+        args.combine_scatter_direct_accum_stg,
         args.use_tma_store,
         get_default_epilogue_type(args.epilogue_type));
     }
@@ -240,6 +243,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .combine_top_k = 0u,
         .gmem_d = d.data_ptr(),
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .combine_scatter_direct_accum_stg = false,
         .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -272,6 +276,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const std::optional<torch::Tensor>& combine_buffer_ptrs = std::nullopt,
                                                     const std::optional<int>& combine_tokens_per_rank = std::nullopt,
                                                     const std::optional<int>& combine_top_k = std::nullopt,
+                                                    const bool& combine_scatter_direct_accum_stg = false,
                                                     const bool& use_tma_store = true,
                                                     const std::optional<int64_t>& tma_store_ptr_override = std::nullopt) {
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
@@ -321,6 +326,8 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         DG_HOST_ASSERT(combine_buffer_ptrs->scalar_type() == torch::kLong);
         DG_HOST_ASSERT(combine_buffer_ptrs->numel() > 0 and combine_buffer_ptrs->numel() <= 8);
         DG_HOST_ASSERT(n % 8 == 0 and "combine-scatter requires N to be 16-byte aligned");
+        if (combine_scatter_direct_accum_stg)
+            DG_HOST_ASSERT(n % 32 == 0 and "direct combine-scatter requires N32-permuted B");
         DG_HOST_ASSERT(combine_tokens_per_rank.value() > 0);
         DG_HOST_ASSERT(combine_top_k.value() > 0);
     } else {
@@ -328,6 +335,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         DG_HOST_ASSERT(not combine_buffer_ptrs.has_value());
         DG_HOST_ASSERT(not combine_tokens_per_rank.has_value());
         DG_HOST_ASSERT(not combine_top_k.has_value());
+        DG_HOST_ASSERT(not combine_scatter_direct_accum_stg);
     }
 
     const auto gemm_type = use_psum_layout ?
@@ -392,7 +400,8 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     const SM90FP8Gemm1D2DRuntime::Args& args = {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
+        .launch_args = LaunchArgs(config.launch_config.num_sms,
+                                  config.launch_config.num_threads,
                                   config.pipeline_config.smem_size + combine_scatter_smem_size,
                                   config.layout.get_cluster_size()),
         .epilogue_type = std::nullopt,
@@ -417,6 +426,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .combine_top_k = has_combine_scatter ? static_cast<uint32_t>(combine_top_k.value()) : 0u,
         .gmem_d = tensor_map_d_base,
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .combine_scatter_direct_accum_stg = has_combine_scatter and combine_scatter_direct_accum_stg,
         .use_tma_store = use_tma_store,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -504,6 +514,7 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .combine_top_k = 0u,
         .gmem_d = d.data_ptr(),
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .combine_scatter_direct_accum_stg = false,
         .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -597,6 +608,7 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .combine_top_k = 0u,
         .gmem_d = d.data_ptr(),
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .combine_scatter_direct_accum_stg = false,
         .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,

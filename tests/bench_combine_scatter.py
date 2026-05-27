@@ -52,6 +52,18 @@ def _align(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _make_wgmma_n32_physical_to_logical_index(n: int, device: torch.device) -> torch.Tensor:
+    if n % 32 != 0:
+        raise ValueError(f'N must be divisible by 32 for WGMMA N permutation, got {n}')
+    in_tile_physical = torch.arange(32, device=device)
+    pair = in_tile_physical // 8
+    lane_group = (in_tile_physical % 8) // 2
+    elem = in_tile_physical % 2
+    in_tile_logical = lane_group * 8 + pair * 2 + elem
+    tile_base = torch.arange(0, n, 32, device=device).unsqueeze(1)
+    return (tile_base + in_tile_logical.unsqueeze(0)).reshape(-1).to(torch.long)
+
+
 def _build_compact_gemm2_layout(routing_topk: torch.Tensor,
                                 rank: int,
                                 num_ranks: int,
@@ -319,6 +331,11 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     n_eff = args.n * args.num_weights
     torch.manual_seed(0x5678 + rank)
     b_bf16 = torch.randn((num_experts, n_eff, hidden), dtype=torch.bfloat16, device='cuda')
+    n_physical_to_logical = None
+    if args.combine_scatter_direct_accum_stg:
+        _rank0_print(rank, 'Permuting B within each 32-wide N chunk for direct accumulator stores...')
+        n_physical_to_logical = _make_wgmma_n32_physical_to_logical_index(n_eff, b_bf16.device)
+        b_bf16 = b_bf16.index_select(1, n_physical_to_logical).contiguous()
     b_fp8 = grouped_cast_fp8_fp4_with_major(
         b_bf16, MajorTypeAB.KMajor, quant_config.gran_k_b,
         quant_config.is_fp4_b, use_ue8m0=False, use_block_cast_for_fp8=True)
@@ -366,7 +383,8 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                       combine_row_topk=row_to_topk,
                       combine_buffer_ptrs=combine_buffer_ptrs_t,
                       combine_tokens_per_rank=tokens_per_rank,
-                      combine_top_k=combine_top_k)
+                      combine_top_k=combine_top_k,
+                      combine_scatter_direct_accum_stg=args.combine_scatter_direct_accum_stg)
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             (a_pool, sfa_global), b_fp8, d, psum_layout,
             recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
@@ -474,8 +492,12 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             fn()
             torch.cuda.synchronize()
             dist.barrier(group=group)
+            d_for_check = d
+            if n_physical_to_logical is not None:
+                d_for_check = torch.empty_like(d)
+                d_for_check[:, n_physical_to_logical] = d
             max_diff_t, mismatch_count_t = deep_gemm.check_combine_scatter_output(
-                d, combine_src_index, row_to_topk, combine_buffer_ptrs_t,
+                d_for_check, combine_src_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, 0.0)
             torch.cuda.synchronize()
             dist.all_reduce(max_diff_t, op=dist.ReduceOp.MAX, group=group)
@@ -498,8 +520,12 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             run_gemm_no_scatter()
             torch.cuda.synchronize()
             dist.barrier(group=group)
+            d_for_cpu_ref = d
+            if n_physical_to_logical is not None:
+                d_for_cpu_ref = torch.empty_like(d)
+                d_for_cpu_ref[:, n_physical_to_logical] = d
             cpu_reference = _build_cpu_combine_reference(
-                d, combine_src_index, row_to_topk, combine_topk_scores,
+                d_for_cpu_ref, combine_src_index, row_to_topk, combine_topk_scores,
                 tokens_per_rank, combine_top_k, num_ranks, cpu_ref_tokens, group)
             torch.cuda.synchronize()
             dist.barrier(group=group)
@@ -676,7 +702,8 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
               f'global_top_k={combine_top_k}, local_top_k={local_top_k}', flush=True)
         print(f'  m_logical={m_logical}, n={args.n}, num_weights={args.num_weights}, n_eff={n_eff}', flush=True)
         layout_name = f'compact-gemm2/{args.compact_layout_order}' if use_compact_gemm2_layout else 'rank-padded'
-        print(f'  gather_a={not args.no_gather_a}, layout={layout_name}', flush=True)
+        print(f'  gather_a={not args.no_gather_a}, layout={layout_name}, '
+              f'direct_accum_stg={args.combine_scatter_direct_accum_stg}', flush=True)
         if args.bench_reduce_scatter:
             print(f'  nccl_ctas={os.environ["NCCL_MIN_CTAS"]}/{os.environ["NCCL_MAX_CTAS"]}', flush=True)
         print('  common components:', flush=True)
@@ -753,6 +780,8 @@ def main() -> None:
                         help='Benchmark a row-major no-scatter GEMM whose TMA epilogue writes D to a peer rank')
     parser.add_argument('--bench-peer-stg-store', action='store_true',
                         help='Benchmark a row-major no-scatter GEMM whose STG epilogue writes D to a peer rank')
+    parser.add_argument('--combine-scatter-direct-accum-stg', action='store_true',
+                        help='Use the N32-permuted direct-accumulator combine-scatter epilogue')
     parser.add_argument('--bench-reduce-scatter', action='store_true',
                         help='Benchmark GEMM + local pack/reduce + NCCL reduce-scatter baseline')
     parser.add_argument('--scatter-rows-per-block', type=int, default=4,
