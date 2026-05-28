@@ -24,9 +24,9 @@ sys.path.insert(0, REPO_ROOT)
 import torch
 import torch.distributed as dist
 
-import deep_gemm
-from deep_gemm.testing import get_arch_major
-from deep_gemm.utils.dist import dist_print, init_dist
+import deep_gemm_moe_L2
+from deep_gemm_moe_L2.testing import get_arch_major
+from deep_gemm_moe_L2.utils.dist import dist_print, init_dist
 
 sys.path.insert(0, os.path.dirname(__file__))
 from generators import (  # noqa: E402
@@ -85,7 +85,7 @@ def _build_compact_gemm2_layout(routing_topk: torch.Tensor,
                                 local_top_k: int,
                                 num_experts: int,
                                 layout_order: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    alignment = deep_gemm_moe_L2.get_mk_alignment_for_contiguous_layout()
     cursor = 0
     psum_values: list[int] = []
     row_chunks: list[tuple[int, torch.Tensor, torch.Tensor]] = []
@@ -354,9 +354,9 @@ def _check_against_reference(label: str,
 
 def _init_nccl_cpp_comm(rank: int, num_ranks: int, local_rank: int,
                         group: dist.ProcessGroup):
-    nccl_unique_ids = [deep_gemm.nccl_get_unique_id() if rank == 0 else None]
+    nccl_unique_ids = [deep_gemm_moe_L2.nccl_get_unique_id() if rank == 0 else None]
     dist.broadcast_object_list(nccl_unique_ids, src=0, group=group)
-    comm = deep_gemm.nccl_comm_init_rank(nccl_unique_ids[0], rank, num_ranks, local_rank)
+    comm = deep_gemm_moe_L2.nccl_comm_init_rank(nccl_unique_ids[0], rank, num_ranks, local_rank)
     dist.barrier(group=group)
     return comm
 
@@ -399,7 +399,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     else:
         _rank0_print(rank, 'Building rank-padded gather layout...')
         gather_index, _tile_rank, _grouped_layout, m_logical_t, psum_layout, row_to_topk = \
-            deep_gemm.build_gather_layout_for_rank_overlap(
+            deep_gemm_moe_L2.build_gather_layout_for_rank_overlap(
                 routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m,
                 topk_slot_offset=rank * local_top_k)
         m_logical = int(m_logical_t.item())
@@ -448,8 +448,8 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     if args.bench_peer_tma_store or args.bench_peer_stg_store:
         peer_tma_d_local = torch.empty_like(d)
         peer_tma_handles = [None] * num_ranks
-        dist.all_gather_object(peer_tma_handles, deep_gemm.cuda_ipc_get_mem_handle(peer_tma_d_local), group=group)
-        peer_tma_ptrs = deep_gemm.cuda_ipc_open_mem_handles(peer_tma_handles, rank, peer_tma_d_local)
+        dist.all_gather_object(peer_tma_handles, deep_gemm_moe_L2.cuda_ipc_get_mem_handle(peer_tma_d_local), group=group)
+        peer_tma_ptrs = deep_gemm_moe_L2.cuda_ipc_open_mem_handles(peer_tma_handles, rank, peer_tma_d_local)
         peer_tma_dst_rank = (rank + 1) % num_ranks
         peer_tma_ptr_override = int(peer_tma_ptrs[peer_tma_dst_rank])
 
@@ -554,7 +554,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
 
     def run_standalone_scatter() -> None:
         with torch.cuda.stream(compute_stream):
-            deep_gemm.combine_scatter_copy_rows(
+            deep_gemm_moe_L2.combine_scatter_copy_rows(
                 d, combine_src_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, args.scatter_rows_per_block)
         torch.cuda.current_stream().wait_stream(compute_stream)
@@ -562,7 +562,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     def run_two_stage_scatter() -> None:
         with torch.cuda.stream(compute_stream):
             launch_gemm(enable_combine_scatter=False)
-            deep_gemm.combine_scatter_copy_rows(
+            deep_gemm_moe_L2.combine_scatter_copy_rows(
                 d, combine_src_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, args.scatter_rows_per_block)
         torch.cuda.current_stream().wait_stream(compute_stream)
@@ -570,26 +570,26 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     def run_pack_for_reduce_scatter() -> None:
         with torch.cuda.stream(compute_stream):
             reduce_scatter_input.zero_()
-            deep_gemm.combine_pack_for_reduce_scatter(
+            deep_gemm_moe_L2.combine_pack_for_reduce_scatter(
                 d, combine_src_index, row_to_topk, combine_topk_scores, reduce_scatter_input,
                 tokens_per_rank, combine_top_k)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
     def run_nccl_reduce_scatter() -> None:
         with torch.cuda.stream(comm_stream):
-            deep_gemm.nccl_reduce_scatter_sum(reduce_scatter_input, reduce_scatter_output, nccl_cpp_comm)
+            deep_gemm_moe_L2.nccl_reduce_scatter_sum(reduce_scatter_input, reduce_scatter_output, nccl_cpp_comm)
         torch.cuda.current_stream().wait_stream(comm_stream)
 
     def run_reduce_scatter_baseline() -> None:
         with torch.cuda.stream(compute_stream):
             launch_gemm(enable_combine_scatter=False)
             reduce_scatter_input.zero_()
-            deep_gemm.combine_pack_for_reduce_scatter(
+            deep_gemm_moe_L2.combine_pack_for_reduce_scatter(
                 d, combine_src_index, row_to_topk, combine_topk_scores, reduce_scatter_input,
                 tokens_per_rank, combine_top_k)
         with torch.cuda.stream(comm_stream):
             comm_stream.wait_stream(compute_stream)
-            deep_gemm.nccl_reduce_scatter_sum(reduce_scatter_input, reduce_scatter_output, nccl_cpp_comm)
+            deep_gemm_moe_L2.nccl_reduce_scatter_sum(reduce_scatter_input, reduce_scatter_output, nccl_cpp_comm)
         torch.cuda.current_stream().wait_stream(compute_stream)
         torch.cuda.current_stream().wait_stream(comm_stream)
 
@@ -599,7 +599,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                 deep_gemm.combine_reduce_slots_fp8(
                     combine_buffer, combine_scales, local_topk_scores, fused_reduce_output)
             else:
-                deep_gemm.combine_reduce_slots(combine_buffer, local_topk_scores, fused_reduce_output)
+                deep_gemm_moe_L2.combine_reduce_slots(combine_buffer, local_topk_scores, fused_reduce_output)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
     def run_fused_scatter_then_local_reduce() -> None:
@@ -632,7 +632,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             if n_physical_to_logical is not None:
                 d_for_check = torch.empty_like(d)
                 d_for_check[:, n_physical_to_logical] = d
-            max_diff_t, mismatch_count_t = deep_gemm.check_combine_scatter_output(
+            max_diff_t, mismatch_count_t = deep_gemm_moe_L2.check_combine_scatter_output(
                 d_for_check, combine_src_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, 0.0)
             torch.cuda.synchronize()

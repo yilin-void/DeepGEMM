@@ -18,6 +18,9 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 from scripts.generate_pyi import generate_pyi_file
 
+source_package_name = 'deep_gemm'
+wheel_name = 'deep_gemm_moe_L2'
+package_name = 'deep_gemm_moe_L2'
 
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
@@ -39,7 +42,7 @@ sources = ['csrc/python_api.cpp']
 build_include_dirs = [
     f'{CUDA_HOME}/include',
     f'{CUDA_HOME}/include/cccl',
-    os.path.join(current_dir, 'deep_gemm/include'),
+    os.path.join(current_dir, source_package_name, 'include'),
     os.path.join(current_dir, 'third-party/cutlass/include'),
     os.path.join(current_dir, 'third-party/fmt/include'),
 ]
@@ -55,7 +58,7 @@ base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag
 
 
 def get_package_version():
-    with open(Path(current_dir) / 'deep_gemm' / '__init__.py', 'r') as f:
+    with open(Path(current_dir) / source_package_name / '__init__.py', 'r') as f:
         version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
 
@@ -97,7 +100,7 @@ def get_wheel_url():
     cuda_version = f'{cuda_version.major}'
 
     # Determine wheel URL based on CUDA version, torch version, python version and OS
-    wheel_filename = f'deep_gemm-{deep_gemm_version}+cu{cuda_version}-torch{torch_version}-cxx11abi{cxx11_abi}-{python_version}-{platform_name}.whl'
+    wheel_filename = f'{wheel_name}-{deep_gemm_version}+cu{cuda_version}-torch{torch_version}-cxx11abi{cxx11_abi}-{python_version}-{platform_name}.whl'
     wheel_url = base_wheel_url.format(tag_name=f'v{deep_gemm_version}', wheel_name=wheel_filename)
     return wheel_url, wheel_filename
 
@@ -106,7 +109,7 @@ def get_ext_modules():
     if DG_SKIP_CUDA_BUILD:
         return []
 
-    return [CUDAExtension(name='deep_gemm._C',
+    return [CUDAExtension(name=f'{package_name}._C',
                           sources=sources,
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
@@ -131,7 +134,7 @@ class CustomBuildPy(build_py):
     def generate_pyi_file(self):
         generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')
         pyi_source = os.path.join(current_dir, 'stubs', '_C.pyi')
-        pyi_target = os.path.join(self.build_lib, 'deep_gemm', '_C.pyi')
+        pyi_target = os.path.join(self.build_lib, package_name, '_C.pyi')
 
         if os.path.exists(pyi_source):
             print(f"Copying .pyi file from {pyi_source} to {pyi_target}")
@@ -146,12 +149,12 @@ class CustomBuildPy(build_py):
         for name in ('DG_JIT_CACHE_DIR', 'DG_JIT_PRINT_COMPILER_COMMAND', 'DG_JIT_CPP_STANDARD'):
             code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
 
-        with open(os.path.join(self.build_lib, 'deep_gemm', 'envs.py'), 'w') as f:
+        with open(os.path.join(self.build_lib, package_name, 'envs.py'), 'w') as f:
             f.write(code)
 
     def prepare_includes(self):
         # Create temporary build directory instead of modifying package directory
-        build_include_dir = os.path.join(self.build_lib, 'deep_gemm/include')
+        build_include_dir = os.path.join(self.build_lib, package_name, 'include')
         os.makedirs(build_include_dir, exist_ok=True)
 
         # Copy third-party includes to the build directory
@@ -195,14 +198,23 @@ class CachedWheelsCommand(_bdist_wheel):
             super().run()
 
 
+def get_packages():
+    packages = []
+    for name in find_packages('.'):
+        if name == source_package_name or name.startswith(f'{source_package_name}.'):
+            packages.append(package_name + name[len(source_package_name):])
+    return packages
+
+
 if __name__ == '__main__':
     # noinspection PyTypeChecker
     setuptools.setup(
-        name='deep_gemm',
+        name=f'{wheel_name}',
         version=get_package_version(),
-        packages=find_packages('.'),
+        packages=get_packages(),
+        package_dir={package_name: source_package_name},
         package_data={
-            'deep_gemm': [
+            package_name: [
                 'include/deep_gemm/**/*',
                 'include/cute/**/*',
                 'include/cutlass/**/*',

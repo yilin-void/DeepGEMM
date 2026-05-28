@@ -3,8 +3,8 @@ import random
 import torch
 from typing import Generator, List, Optional, Tuple
 
-from deep_gemm.testing import get_arch_major
-from deep_gemm.utils import (
+from deep_gemm_moe_L2.testing import get_arch_major
+from deep_gemm_moe_L2.utils import (
     align, ceil_div,
     per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8,
     per_token_cast_to_fp4, transpose_packed_fp4,
