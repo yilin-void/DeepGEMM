@@ -44,11 +44,13 @@ public:
         // [local_token, topk_slot, n].
         void *combine_row_topk;      // (m,) int32; nullptr disables combine-scatter
         void *combine_buffer_ptrs;   // (num_ranks,) int64/uint64 device pointer table
+        void *combine_scale_ptrs;    // optional (num_ranks,) int64/uint64 device pointer table
         uint32_t combine_tokens_per_rank;
         uint32_t combine_top_k;
         void *gmem_d;
         uint32_t stride_d;
         bool combine_scatter_direct_accum_stg;
+        bool combine_scatter_fp8;
         bool use_tma_store;
         // TMA descriptors kept for reference (A/sfa currently unused in kernel)
         CUtensorMap tensor_map_a;
@@ -77,6 +79,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -96,6 +99,7 @@ static void __instantiate_kernel() {{
         args.gather_index != nullptr,
         args.combine_row_topk != nullptr,
         args.combine_scatter_direct_accum_stg,
+        args.combine_scatter_fp8,
         args.use_tma_store,
         get_default_epilogue_type(args.epilogue_type));
     }
@@ -109,7 +113,7 @@ static void __instantiate_kernel() {{
             args.gmem_sfa, args.stride_sfa, args.sfa_is_mn_major,
             args.gather_index, args.combine_src_index,
             args.rank_flags, args.tile_rank, args.num_ranks, args.rank_flag_epoch,
-            args.combine_row_topk, args.combine_buffer_ptrs,
+            args.combine_row_topk, args.combine_buffer_ptrs, args.combine_scale_ptrs,
             args.combine_tokens_per_rank, args.combine_top_k,
             args.gmem_d, args.stride_d,
             args.tensor_map_a, args.tensor_map_b,
@@ -236,11 +240,13 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .rank_flag_epoch = has_overlap ? static_cast<uint64_t>(rank_flag_epoch.value()) : 0ULL,
         .combine_row_topk = nullptr,
         .combine_buffer_ptrs = nullptr,
+        .combine_scale_ptrs = nullptr,
         .combine_tokens_per_rank = 0u,
         .combine_top_k = 0u,
         .gmem_d = d.data_ptr(),
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
         .combine_scatter_direct_accum_stg = false,
+        .combine_scatter_fp8 = false,
         .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -271,9 +277,11 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const std::optional<torch::Tensor>& combine_src_index = std::nullopt,
                                                     const std::optional<torch::Tensor>& combine_row_topk = std::nullopt,
                                                     const std::optional<torch::Tensor>& combine_buffer_ptrs = std::nullopt,
+                                                    const std::optional<torch::Tensor>& combine_scale_ptrs = std::nullopt,
                                                     const std::optional<int>& combine_tokens_per_rank = std::nullopt,
                                                     const std::optional<int>& combine_top_k = std::nullopt,
                                                     const bool& combine_scatter_direct_accum_stg = false,
+                                                    const bool& combine_scatter_fp8 = false,
                                                     const bool& use_tma_store = true,
                                                     const std::optional<int64_t>& tma_store_ptr_override = std::nullopt) {
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
@@ -322,17 +330,29 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         DG_HOST_ASSERT(combine_buffer_ptrs->is_cuda() and combine_buffer_ptrs->is_contiguous());
         DG_HOST_ASSERT(combine_buffer_ptrs->scalar_type() == torch::kLong);
         DG_HOST_ASSERT(combine_buffer_ptrs->numel() > 0 and combine_buffer_ptrs->numel() <= 8);
+        if (combine_scatter_fp8) {
+            DG_HOST_ASSERT(combine_scatter_direct_accum_stg and "FP8 combine-scatter requires direct accumulator stores");
+            DG_HOST_ASSERT(combine_scale_ptrs.has_value());
+            DG_HOST_ASSERT(combine_scale_ptrs->is_cuda() and combine_scale_ptrs->is_contiguous());
+            DG_HOST_ASSERT(combine_scale_ptrs->scalar_type() == torch::kLong);
+            DG_HOST_ASSERT(combine_scale_ptrs->numel() == combine_buffer_ptrs->numel());
+            DG_HOST_ASSERT(n % 64 == 0 and "FP8 combine-scatter uses N64-permuted direct stores");
+        } else {
+            DG_HOST_ASSERT(not combine_scale_ptrs.has_value());
+        }
         DG_HOST_ASSERT(n % 8 == 0 and "combine-scatter requires N to be 16-byte aligned");
         if (combine_scatter_direct_accum_stg)
-            DG_HOST_ASSERT(n % 32 == 0 and "direct combine-scatter requires N32-permuted B");
+            DG_HOST_ASSERT(n % 32 == 0 and "direct combine-scatter requires N-aligned B permutation");
         DG_HOST_ASSERT(combine_tokens_per_rank.value() > 0);
         DG_HOST_ASSERT(combine_top_k.value() > 0);
     } else {
         DG_HOST_ASSERT(not combine_src_index.has_value());
         DG_HOST_ASSERT(not combine_buffer_ptrs.has_value());
+        DG_HOST_ASSERT(not combine_scale_ptrs.has_value());
         DG_HOST_ASSERT(not combine_tokens_per_rank.has_value());
         DG_HOST_ASSERT(not combine_top_k.has_value());
         DG_HOST_ASSERT(not combine_scatter_direct_accum_stg);
+        DG_HOST_ASSERT(not combine_scatter_fp8);
     }
 
     const auto gemm_type = use_psum_layout ?
@@ -390,7 +410,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, config.layout.block_k, 1, 0);
     const int combine_scatter_smem_size = has_combine_scatter ?
-        config.layout.block_m * static_cast<int>(sizeof(uint64_t)) : 0;
+        config.layout.block_m * static_cast<int>(sizeof(uint64_t)) * (combine_scatter_fp8 ? 2 : 1) : 0;
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
@@ -418,11 +438,13 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .rank_flag_epoch = has_overlap ? static_cast<uint64_t>(rank_flag_epoch.value()) : 0ULL,
         .combine_row_topk = has_combine_scatter ? combine_row_topk->data_ptr() : nullptr,
         .combine_buffer_ptrs = has_combine_scatter ? combine_buffer_ptrs->data_ptr() : nullptr,
+        .combine_scale_ptrs = (has_combine_scatter and combine_scatter_fp8) ? combine_scale_ptrs->data_ptr() : nullptr,
         .combine_tokens_per_rank = has_combine_scatter ? static_cast<uint32_t>(combine_tokens_per_rank.value()) : 0u,
         .combine_top_k = has_combine_scatter ? static_cast<uint32_t>(combine_top_k.value()) : 0u,
         .gmem_d = tensor_map_d_base,
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
         .combine_scatter_direct_accum_stg = has_combine_scatter and combine_scatter_direct_accum_stg,
+        .combine_scatter_fp8 = has_combine_scatter and combine_scatter_fp8,
         .use_tma_store = use_tma_store,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -506,11 +528,13 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .rank_flag_epoch = 0ULL,
         .combine_row_topk = nullptr,
         .combine_buffer_ptrs = nullptr,
+        .combine_scale_ptrs = nullptr,
         .combine_tokens_per_rank = 0u,
         .combine_top_k = 0u,
         .gmem_d = d.data_ptr(),
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
         .combine_scatter_direct_accum_stg = false,
+        .combine_scatter_fp8 = false,
         .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -600,11 +624,13 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .rank_flag_epoch = 0ULL,
         .combine_row_topk = nullptr,
         .combine_buffer_ptrs = nullptr,
+        .combine_scale_ptrs = nullptr,
         .combine_tokens_per_rank = 0u,
         .combine_top_k = 0u,
         .gmem_d = d.data_ptr(),
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
         .combine_scatter_direct_accum_stg = false,
+        .combine_scatter_fp8 = false,
         .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,

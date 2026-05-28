@@ -142,14 +142,21 @@ global store。
 combine_src_index:        Optional[Tensor[int32]]
 combine_row_topk:         Optional[Tensor[int32]]
 combine_buffer_ptrs:      Optional[Tensor[int64]]
+combine_scale_ptrs:       Optional[Tensor[int64]]
 combine_tokens_per_rank:  Optional[int]
 combine_top_k:            Optional[int]
 combine_scatter_direct_accum_stg: bool = false
+combine_scatter_fp8:      bool = false
 ```
 
 当 `combine_row_topk` 非空时，GEMM 进入 combine-scatter epilogue；否则保持原有
 TMA store D 的行为。`combine_src_index` 可不传；这种情况下实现会复用
 `gather_index` 作为 source-token map，以兼容原来的 GEMM1-style 调用。
+
+当 `combine_scatter_fp8=true` 时，GEMM epilogue 不再把 raw BF16 结果写入
+combine buffer，而是把结果量化为 E4M3 FP8，并额外写出每行每 32 个 N 元素一个
+FP32 scale。source rank 上的 local reduction 会读取 FP8 data 和 scale，反量化后再
+乘 top-k score。
 
 ### 3.2 输入含义
 
@@ -159,6 +166,7 @@ TMA store D 的行为。`combine_src_index` 可不传；这种情况下实现会
 | `combine_src_index` | optional `(M,) int32 CUDA contiguous` | output row 到 global source token 的映射；为空时回退使用 `gather_index` |
 | `combine_row_topk` | `(M,) int32 CUDA contiguous` | output row 最终写入的 top-k slot |
 | `combine_buffer_ptrs` | `(num_ranks,) int64 CUDA contiguous` | 每个 source rank 的 combine buffer device pointer |
+| `combine_scale_ptrs` | optional `(num_ranks,) int64 CUDA contiguous` | FP8 combine-scatter scale buffer device pointer |
 | `combine_tokens_per_rank` | scalar int | 每个 rank 的 token 数 |
 | `combine_top_k` | scalar int | combine buffer 的 top-k 槽数 |
 
@@ -167,6 +175,10 @@ TMA store D 的行为。`combine_src_index` 可不传；这种情况下实现会
 ```text
 [tokens_per_rank, combine_top_k, N]
 ```
+
+`combine_scatter_fp8=true` 时，`combine_buffer_ptrs[r]` 指向 FP8 buffer，逻辑形状仍为
+`[tokens_per_rank, combine_top_k, N]`；`combine_scale_ptrs[r]` 指向 FP32 scale buffer，
+逻辑形状为 `[tokens_per_rank, combine_top_k, N / 32]`。
 
 device 侧写入位置：
 
@@ -194,10 +206,12 @@ out[token, col] = sum_slot bf16(combine_buffer[token, slot, col]) * topk_scores[
 当前实现有如下约束：
 
 - 只覆盖 SM90 FP8 1D2D m-grouped contiguous 路径。
-- 输出 dtype 当前按 BF16 处理。
+- 默认 combine buffer dtype 为 BF16；`combine_scatter_fp8=true` 时为 E4M3 FP8。
 - `combine-scatter` 必须提供 `combine_src_index` 或 `gather_index` 中的一个。
 - `combine_buffer_ptrs.numel() <= 8`。
-- `N % 8 == 0`，因为 epilogue 使用 16B `uint4` store（8 个 BF16）。
+- BF16 combine-scatter 要求 `N % 8 == 0`，因为 epilogue 使用 16B store（8 个 BF16）。
+- FP8 direct combine-scatter 要求 `N % 64 == 0`，因为它使用 N64 B 重排和 16B store
+  （16 个 FP8）。
 - multi-rank benchmark 中，`combine-scatter` 只允许 `all-ranks-local` routing。
 
 最后一条是语义约束，不是实现细节。`random` routing 下多个 rank 可能写同一个
@@ -273,7 +287,7 @@ allocator 的 base allocation offset：IPC handle 对应的是 allocation base�
 writer rank 通过自己的 IPC mapping 读写会自洽，但 owner rank 用本地 tensor 指针做
 local reduction 时会看不到 remote slot。
 
-### 4.3 两种 scatter epilogue
+### 4.3 三种 scatter epilogue
 
 默认 scatter epilogue 仍保留 staged 路径：
 
@@ -317,7 +331,7 @@ for (uint32_t elem = 0; elem < 8; ++elem)
 当 `shape_n` 尾部不足 8 个 BF16 时，会退化成 element-wise tail store。不过 host
 侧当前要求 `N % 8 == 0`，正常 benchmark 不会走 tail。
 
-N32 direct epilogue 由 `combine_scatter_direct_accum_stg=true` 打开。它要求调用侧
+BF16 direct epilogue 由 `combine_scatter_direct_accum_stg=true` 打开。它要求调用侧
 在 FP8 cast 之前按每 32 个 N 做一次 B 重排，使 WGMMA accumulator owner lanes 在
 同一条 store 指令里写相邻 16B segment：
 
@@ -331,6 +345,30 @@ lane3 -> n + 24 .. n + 31
 benchmark 中该重排由 `_make_wgmma_n32_physical_to_logical_index` 完成。N32 direct
 path 直接把 accumulator pack 成 8 个 BF16，并用 `st.global.v4.u32` 写到 peer
 combine buffer，跳过 STSM 和 shared-memory reload。
+
+FP8 direct epilogue 由 `combine_scatter_direct_accum_stg=true` 和
+`combine_scatter_fp8=true` 同时打开。它使用 N64 B 重排，使每个 lane 能在同一行拿到
+16 个连续 FP8 输出元素，并恢复 16B peer store：
+
+```text
+lane0 -> n +  0 .. n + 15
+lane1 -> n + 16 .. n + 31
+lane2 -> n + 32 .. n + 47
+lane3 -> n + 48 .. n + 63
+```
+
+benchmark 中该重排由 `_make_wgmma_n64_physical_to_logical_index` 完成。FP8 path 对
+每行每 32 个 N 元素生成一个 FP32 scale，因此每个 lane 写 16 个 FP8 元素时，会和
+相邻 lane 做一次 2-lane amax reduction，共同覆盖 32 个元素的 scale group：
+
+```text
+lanes 0..1 -> scale group 0, cols n +  0 .. n + 31
+lanes 2..3 -> scale group 1, cols n + 32 .. n + 63
+```
+
+这里的 `__shfl_xor_sync` 使用精确的 2-lane mask，而不是 full-warp mask。pad row 或
+非法 row 会在 store lambda 里提前跳过，如果 full-warp mask 包含未参与的 lane，会造成
+未定义同步行为并可能让多 rank benchmark 卡住。
 
 ### 4.4 与原 TMA store 路径的关系
 
@@ -476,6 +514,21 @@ out[token, col] = sum_slot combine_buffer[token, slot, col] * topk_scores[token,
 模板参数。这样可以避免原先 per-element 线性索引里的除法/取模，并且每个 token
 的每个 column tile 只把 top-k score 读到 shared memory 一次，再供该 tile 内线程复用。
 
+FP8 combine-scatter 对应 `combine_reduce_slots_fp8`。它读取：
+
+```text
+combine_buffer_fp8[tokens_per_rank, combine_top_k, N]
+combine_scales_fp32[tokens_per_rank, combine_top_k, N / 32]
+```
+
+然后在 local reduction 中做：
+
+```text
+value = fp8_to_float(combine_buffer_fp8[token, slot, col])
+      * combine_scales_fp32[token, slot, col / 32]
+out[token, col] += value * topk_scores[token, slot]
+```
+
 两条路径在数学上等价，但 reduction 顺序不同，所以 correctness 用 tolerance，而不是
 要求 bit-exact。
 
@@ -497,7 +550,10 @@ tests/bench_combine_scatter.py
 --bench-reduce-scatter        # 同时跑 GEMM + pack/local-reduce + NCCL reduce-scatter baseline
 --no-gather-a                 # GEMM2-style：A/SFA 已按 grouped row 连续排布
 --combine-scatter-direct-accum-stg
-                              # 使用 N32 B 重排 + direct accumulator STG epilogue
+                              # BF16 使用 N32，FP8 使用 N64 direct accumulator epilogue
+--combine-scatter-fp8         # 使用 FP8 combine buffer + FP32 scales
+--combine-scatter-local-buffer
+                              # 诊断用：把 peer destination 重定向到本地 HBM
 --scatter-rows-per-block      # standalone scatter-copy 的 rows/CTA，默认 4
 --compact-layout-order        # compact GEMM2 row order：token 或 ring，默认 token
 ```
@@ -578,7 +634,7 @@ python3 tests/bench_combine_scatter.py \
   --iters 5
 ```
 
-N32 direct-accumulator epilogue 命令：
+BF16 N32 direct-accumulator epilogue 命令：
 
 ```bash
 NCCL_MIN_CTAS=64 NCCL_MAX_CTAS=64 \
@@ -596,14 +652,23 @@ python3 tests/bench_combine_scatter.py \
   --iters 5
 ```
 
-log：
+FP8 N64 direct-accumulator epilogue 命令：
 
-```text
-workspace/logs/bench_scatter_compare_target_h200_20260527_002404.log
-workspace/logs/bench_direct_n32_permuted_b_target_h200_20260527_004037.log
-workspace/logs/bench_direct_n32_permuted_b_target_check_h200_20260527_004125.log
-workspace/logs/bench_cleanup_n32_target_h200_20260527_005346.log
-workspace/logs/bench_cleanup_n32_small_check_h200_20260527_005311.log
+```bash
+NCCL_MIN_CTAS=64 NCCL_MAX_CTAS=64 \
+python3 tests/bench_combine_scatter.py \
+  --num-local-ranks 8 \
+  --tokens-per-rank 6976 \
+  --hidden 1280 \
+  --n 2048 \
+  --top-k 16 \
+  --global-num-experts 512 \
+  --experts-per-rank-token 2 \
+  --no-gather-a \
+  --combine-scatter-direct-accum-stg \
+  --combine-scatter-fp8 \
+  --warmups 5 \
+  --iters 20
 ```
 
 ### 6.2 结果
@@ -623,12 +688,14 @@ layout = compact-gemm2/token
 ```
 
 结果按方案拆分如下。表里 `total` 是直接测整条路径的 median，不是把各组件 median
-简单相加。
+简单相加。除非特别说明，括号内为 CUDA event time。
 
-| 方案 | GEMM no scatter | fused GEMM + raw scatter | local reduction | total fused + local reduction |
+| 方案 | GEMM no scatter | fused GEMM + scatter | local reduction | total fused + local reduction |
 | --- | ---: | ---: | ---: | ---: |
-| staged epilogue：STSM + smem reload + 16B peer STG | 783.89 us (event 732.29 us) | 1643.71 us (event 1587.74 us) | 206.62 us (event 164.38 us) | 1841.87 us |
-| N32 direct accumulator STG | 781.00 us (event 732.58 us) | 1545.07 us (event 1492.58 us) | 205.77 us (event 163.07 us) | 1781.66 us |
+| BF16 staged：STSM + smem reload + 16B peer STG | 783.89 us (732.29 us) | 1643.71 us (1587.74 us) | 206.62 us (164.38 us) | 1841.87 us |
+| BF16 N32 direct accumulator STG | 785.14 us (801.94 us) | 1568.89 us (1492.59 us) | 203.51 us (162.82 us) | 1753.26 us |
+| FP8 old direct，8B peer store（中间实验） | 839.56 us (765.97 us) | 2111.98 us (2031.46 us) | 273.01 us (203.57 us) | 2328.06 us |
+| FP8 N64 direct，16B peer store | 784.41 us (758.13 us) | 1245.91 us (1188.58 us) | 227.33 us (185.49 us) | 1463.07 us |
 
 correctness：
 
@@ -643,7 +710,11 @@ tokens       = 4
 mismatches   = 0
 ```
 
-### 6.3 解读
+上面的 correctness 是 BF16 path。FP8 path 会引入量化误差，不能和 BF16 CPU
+reference 做 bit-exact 或严格 tolerance 对比；当前性能路径已经跑通，但 FP8 数值
+验收还需要单独定义量化 reference 和误差门限。
+
+### 6.3 解读：BF16、FP8 与 store 粒度
 
 N32 direct epilogue 相比 staged epilogue：
 
@@ -672,7 +743,156 @@ local reduction 的第一轮优化来自
 按 token 和 N tile 分块、模板化 `top_k`、把 score 缓存在 shared memory，并移除
 per-element 的除法/取模。
 
-### 6.4 compact layout row-order 实验
+FP8 的第一次实现直接沿用 N32 思路，每个 lane 只写 8 个 FP8 元素，因此 peer store
+退化为 8B `st.global.v2.u32`。该版本虽然把远端数据量减半，但 fused GEMM+scatter
+event 反而从 BF16 的约 `1493 us` 退化到约 `2031 us`。
+
+N64 重排修正了这个问题：每个 lane 写 16 个连续 FP8 元素，用 16B
+`st.global.v4.u32`。同一 H200 目标 shape 下：
+
+```text
+BF16 N32 direct fused scatter event = 1492.59 us
+FP8 N64 direct fused scatter event  = 1188.58 us
+```
+
+也就是说，FP8 N64 相比 BF16 N32 的 fused scatter 部分快约 `20.4%`，整条
+`fused scatter + local reduction` 路径从 `1753.26 us` 降到 `1463.07 us`，
+快约 `16.6%`。
+
+local-buffer 诊断把 destination pointer table 临时替换成本地 HBM buffer，只用于分离
+本地 quant/store 和远端 peer store 成本：
+
+| 方案 | fused GEMM + scatter event | 说明 |
+| --- | ---: | --- |
+| BF16 N32 remote | 1492.59 us | 正常 peer IPC 写 |
+| FP8 N64 remote | 1188.58 us | 正常 peer IPC 写 |
+| FP8 N64 local-buffer | 965.39 us | 同一 address footprint，但写本地 HBM |
+
+因此 FP8 N64 的本地量化和 16B store 形态已经可接受，剩余差距主要来自远端 peer write。
+
+### 6.4 K sweep 与计算/通信 overlap 模型
+
+为了估计 GEMM 主体计算隐藏通信的比例，固定 M/N/output volume，只 sweep GEMM K：
+
+| K | pure GEMM event | GEMM + scatter event | 暴露通信 `F(K)-C(K)` |
+| ---: | ---: | ---: | ---: |
+| 128 | 184.22 us | 1397.55 us | 1213.33 us |
+| 640 | 415.23 us | 1421.57 us | 1006.34 us |
+| 1280 | 733.68 us | 1500.70 us | 767.02 us |
+| 1920 | 1038.98 us | 1568.02 us | 529.04 us |
+| 2560 | 1371.38 us | 1644.80 us | 273.42 us |
+
+一个更贴近当前 kernel 的一阶模型是：
+
+```text
+pure_gemm(K) = fixed_overhead_x + compute(K)
+```
+
+其中 `fixed_overhead_x` 包括 kernel/scheduler/固定 epilogue overhead；主体计算
+`compute(K)` 随 K 变化，并可以和通信 overlap。假设 K=128 时主体计算足够小，基本被
+通信覆盖，则：
+
+```text
+comm = F(128) - x
+exposed_comm(K) = F(K) - C(K)
+hidden_comm(K) = comm - exposed_comm(K)
+compute(K) = C(K) - x
+
+compute_overlap_ratio(K) = hidden_comm(K) / compute(K)
+comm_hidden_ratio(K) = hidden_comm(K) / comm
+```
+
+用 pure GEMM K sweep 线性拟合得到：
+
+```text
+pure_gemm(K) ~= 111.16 us + 0.488 us * K
+```
+
+即 `x ~= 111.16 us`。代入后：
+
+| K | hidden comm | compute overlap ratio | comm hidden ratio |
+| ---: | ---: | ---: | ---: |
+| 128 | 73.06 us | 100.0% | 5.7% |
+| 640 | 280.05 us | 92.1% | 21.8% |
+| 1280 | 519.37 us | 83.4% | 40.4% |
+| 1920 | 757.35 us | 81.6% | 58.9% |
+| 2560 | 1012.97 us | 80.4% | 78.7% |
+
+这里需要区分两个比例：
+
+- `compute_overlap_ratio`：主体计算中有多少比例与通信同时发生。
+- `comm_hidden_ratio`：通信本身有多少比例被主体计算隐藏。
+
+以 target K=1280 为例，模型给出的结论是主体计算约 `83%` 与通信 overlap，但通信本身
+只被隐藏约 `40%`。这和 kernel 观测一致：K 越大，暴露通信下降；但 target K=1280 时
+peer store 仍然是主瓶颈。
+
+### 6.5 通信量与带宽估算
+
+在目标 shape 下，每个 compute rank 处理所有 source token 在本 rank 2 个 local experts
+上的 fc2 输出。远端写只统计写到其他 7 个 source ranks 的部分：
+
+```text
+remote rows per compute rank = tokens_per_rank * experts_per_rank_token * (num_ranks - 1)
+                             = 6976 * 2 * 7
+```
+
+BF16 remote payload：
+
+```text
+6976 * 2 * 2048 * 2 bytes * 7 = 400.03 MB
+```
+
+FP8 N64 remote payload 包含 FP8 data 和 FP32 scale：
+
+```text
+data  = 6976 * 2 * 2048 * 1 byte  * 7 = 200.02 MB
+scale = 6976 * 2 * (2048 / 32) * 4 bytes * 7 = 25.00 MB
+total = 225.02 MB
+```
+
+用 fused event 与 no-scatter event 的差值粗略估算暴露 remote payload bandwidth：
+
+| 方案 | exposed scatter event | remote payload | effective exposed BW |
+| --- | ---: | ---: | ---: |
+| BF16 N32 | 1492.59 - 801.94 = 690.65 us | 400.03 MB | 579.2 GB/s |
+| FP8 N64 | 1188.58 - 758.13 = 430.45 us | 225.02 MB | 522.8 GB/s |
+
+这个 bandwidth 不是纯 NVLink bandwidth；它混合了 pointer/base 读取、FP8 量化、
+store issue、scoreboard stall、以及部分计算 overlap。更可靠的结论是：FP8 N64
+把远端 payload 降到约 `56.25%`，并把暴露 scatter event 从约 `691 us` 降到约
+`430 us`。
+
+### 6.6 NCU 指标
+
+下面是 BF16 N32 direct remote scatter 的 K sweep NCU 指标。`NVLink TX` 对应每个
+compute rank 的远端写 payload；K=2560 的 NCU counter 返回 `nan`，表里填理论值。
+
+| K | NCU duration | inst executed | eligible warps/cycle | long scoreboard | NVLink TX |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 1450 us | 55.6M | 0.06 | 43.84 | 400.03 MB |
+| 640 | 1470 us | 153.5M | 0.16 | 13.36 | 400.03 MB |
+| 1280 | 1510 us | 305.0M | 0.36 | 5.82 | 400.03 MB |
+| 1920 | 1580 us | 442.5M | 0.51 | 2.75 | 400.03 MB |
+| 2560 | 1730 us | 571.2M | 0.59 | 1.84 | 400.03 MB |
+
+K sweep 的 NCU 指标和 event time 趋势一致：
+
+- K 小时，kernel 接近纯 remote store，`long scoreboard` 很高，eligible warp 很低。
+- K 增大后，WGMMA 计算量增加，更多通信等待被计算覆盖，`long scoreboard` 下降。
+- NVLink TX 与 K 无关，因为输出量固定。
+
+K=1280 的 local-buffer 诊断：
+
+| path | NCU duration | long scoreboard | NVLink TX |
+| --- | ---: | ---: | ---: |
+| BF16 N32 remote | 1510 us | 5.82 | 400.03 MB |
+| BF16 N32 local-buffer | 766 us | 1.66 | 0 MB |
+
+这说明 BF16 N32 path 的主要额外 stall 来自远端 peer store，而不是 accumulator
+pack 或本地 store 指令本身。
+
+### 6.7 compact layout row-order 实验
 
 为了确认 fused scatter 的额外开销是否来自 source-rank row order 导致的 peer-store
 热点，benchmark 增加了 `--compact-layout-order {token,ring}`。
@@ -739,17 +959,7 @@ python3 tests/bench_combine_scatter.py \
 - 这说明当前主要瓶颈不是简单的 source-rank row order 热点。后续优化应继续聚焦
   combine-scatter epilogue 的 remote store 路径和 accumulator 写回结构。
 
-相关 log：
-
-```text
-workspace/logs/bench_compact_ring_check_h200.log
-workspace/logs/bench_compact_token_order_core_h200.log
-workspace/logs/bench_compact_ring_order_core_h200.log
-workspace/logs/bench_compact_token_order_h200.log
-workspace/logs/bench_compact_ring_order_h200.log
-```
-
-### 6.5 N32 direct-store 诊断结论
+### 6.8 direct-store 重排实验结论
 
 direct accumulator store 的关键不是“每个 lane 自己连续”，而是同一条 warp store
 指令里相邻 lane 写相邻的 16B segment。
@@ -795,12 +1005,17 @@ accum_pair_base = vec * 4;
 | N128 direct peer scatter（已撤回） | 4626.54 us (event 4591.52 us) | 206.60 us (event 163.52 us) | 4837.86 us |
 | N32 direct peer scatter（当前保留） | 1545.07 us (event 1492.58 us) | 205.77 us (event 163.07 us) | 1781.66 us |
 
-另一个一次性 local-store 诊断把 peer pointer table 临时替换为本地 buffer，结果为
-`851.18 us wall / 806.53 us event`。这个诊断路径已经从代码中移除；它只说明
-N32 direct epilogue 的本地写回开销已经接近 no-scatter GEMM，当前大头仍是 peer
-store。
+local-buffer 诊断把 peer pointer table 临时替换为本地 buffer，早期 BF16 N32 结果为
+`851.18 us wall / 806.53 us event`。该诊断说明 N32 direct epilogue 的本地写回开销
+已经接近 no-scatter GEMM，当前大头仍是 peer store。这个诊断入口现在保留为
+`--combine-scatter-local-buffer`，用于后续分离本地 store/quantization 和远端 peer
+store 成本。
 
-### 6.6 已撤回的失败尝试
+FP8 path 的对应结论是：不能简单把 BF16 N32 映射套到 FP8 上。N32 时每个 lane 只有
+8 个连续 FP8 元素，只能生成 8B peer store；N64 后每个 lane 有 16 个连续 FP8 元素，
+可以恢复 16B peer store，因此从 `2031.46 us` event 改善到 `1188.58 us` event。
+
+### 6.9 已撤回的失败尝试
 
 以下实验代码已经移除，不再作为 benchmark 或 API surface 保留：
 
@@ -813,7 +1028,7 @@ store。
 
    该版本试图通过每 128 列 B 重排让每个 lane 的 accumulator 在 N 方向连续。
    结果每个 lane 内部连续，但跨 lane store 地址稀疏，peer store 退化严重。
-   它已被 N32 direct store 替代。
+   BF16 path 已被 N32 direct store 替代；FP8 path 使用 N64 direct store。
 
 3. **row-major peer TMA / fixed-peer STG**
 
@@ -825,9 +1040,9 @@ store。
 
 ## 7. 当前局限与后续方向
 
-### 7.1 local reduction 已独立实现并完成第一轮优化
+### 7.1 local reduction 与 FP8 reduction
 
-本实现把每个 expert output 以 raw BF16 写入：
+本实现默认把每个 expert output 以 raw BF16 写入：
 
 ```text
 combine_buffer[token, topk_slot, :]
@@ -839,19 +1054,30 @@ combine_buffer[token, topk_slot, :]
 out[token, :] += combine_buffer[token, topk_slot, :] * topk_scores[token, topk_slot]
 ```
 
-因此当前已经覆盖 fc2 输出的 remote scatter 和 source-rank local combine。第一轮优化后，
-local reduction 在目标 shape 上约为 `164 us` event，但 scatter 和 reduction 仍然是两个
-kernel，中间通过 BF16 combine buffer 连接。
+FP8 path 则写入 FP8 combine buffer 和 FP32 scale buffer，local reduction 中反量化后
+再乘 score。当前 target shape 下 local reduction 约为：
+
+| path | local reduction event |
+| --- | ---: |
+| BF16 combine buffer | 162.82 us |
+| FP8 combine buffer + FP32 scale | 185.49 us |
+
+因此当前已经覆盖 fc2 输出的 remote scatter 和 source-rank local combine，但 scatter
+和 reduction 仍然是两个 kernel。FP8 local reduction 多读 scale，多一次反量化，因此比
+BF16 reduction 慢约 `23 us` event。
+
+FP8 数值验证仍需单独完善。当前 CPU reference 可以模拟每 32 列 scale 的 FP8 量化，但
+小 shape 下用严格 `rtol=0.1, atol=0.2` 仍有少量 mismatch；在正式使用前应根据模型可接受
+误差确定 reference 和 tolerance。
 
 ### 7.2 可能的优化方向
 
 后续优化应优先围绕 epilogue 结构，而不是继续调 grid/block：
 
-1. **继续优化 N32 direct peer store**
+1. **以 FP8 N64 direct peer store 作为当前主线**
 
-   N32 direct epilogue 已经绕过 `STSM -> smem reload`，但相比 no-scatter GEMM
-   仍多约 `760 us` event。下一步应关注 peer store 本身的吞吐、store issue 形态、
-   L2/NVLink 写合并，以及是否能减少每 row 的 pointer/base 读取成本。
+   N64 恢复 16B peer store 后已经明显优于 BF16 N32。下一步应围绕 FP8 path 优化
+   scale 生成、scale store 和 local reduction，而不是退回 8B store 形态。
 
 2. **继续优化 remote store 路径，而不是优先调整 compact row order**
 
@@ -859,26 +1085,31 @@ kernel，中间通过 BF16 combine buffer 连接。
    fused scatter 的主瓶颈。后续应继续关注 peer-store 指令形态、store 粒度、写入合并
    以及 epilogue 内等待和同步成本。
 
-3. **暂不优先推进 row-major TMA intermediate**
+3. **补齐 FP8 correctness**
+
+   性能路径已经验证，但 FP8 量化引入了真实数值误差。需要明确 per-32 scale 的误差
+   目标，或评估 per-token/per-128 scale 等其他粒度，再确定正式 correctness gate。
+
+4. **暂不优先推进 row-major TMA intermediate**
 
    已经做过 fixed-peer 和 tile-rank row-major TMA 实验。它们证明动态 source-rank
    descriptor 选择本身不是主要瓶颈，但 row-major TMA upper-bound 仍然没有显著改善
    端到端性能。除非后续整体 combine contract 发生变化，否则不应继续在这条线上投入
    大量工程复杂度。
 
-4. **继续评估 local reduction 的融合机会**
+5. **继续评估 local reduction 的融合机会**
 
    `combine_reduce_slots` 已经从朴素 per-element kernel 优化为 token/tile 分块。
    后续主要看它是否能和下游算子融合，或者是否需要改变 combine buffer layout 来减少
    中间 BF16 写读。
 
-5. **优化 reduce-scatter baseline 的 pack/local-reduce**
+6. **优化 reduce-scatter baseline 的 pack/local-reduce**
 
    当前 `combine_pack_for_reduce_scatter` 使用 per-element float `atomicAdd`，只是为了
    快速建立等价 baseline。后续可以利用 gather layout 中 `all-ranks-local` 的结构，
    按 token 或 tile 聚合，避免大规模 atomic，才能更公平地评估 reduce-scatter 方案。
 
-6. **重新评估 H100 NVLink 目标环境**
+7. **重新评估 H100 NVLink 目标环境**
 
    当前数据来自 H200。最终 target 是 NVLink H100，因此 peer store 部分仍需要在
    H100 HBM3 / H100 NVL 上复测。

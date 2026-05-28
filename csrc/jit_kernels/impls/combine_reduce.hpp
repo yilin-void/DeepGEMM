@@ -67,6 +67,34 @@ static void __instantiate_kernel() {{
     }
 };
 
+class CombineReduceSlotsFP8Runtime final: public LaunchRuntime<CombineReduceSlotsFP8Runtime> {
+public:
+    struct Args {
+        void *combine_buffer, *combine_scales, *topk_scores, *out;
+        uint32_t tokens_per_rank, top_k, n;
+        uint32_t cols_per_thread;
+        LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/combine_reduce.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_slots_fp8_kernel<{}, {}, {}, 32>);
+}};
+)", args.launch_args.num_threads, args.top_k, args.cols_per_thread);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+            args.combine_buffer, args.combine_scales, args.topk_scores, args.out,
+            args.tokens_per_rank, args.top_k, args.n));
+    }
+};
+
 static void combine_reduce_slots(const torch::Tensor& combine_buffer,
                                  const torch::Tensor& topk_scores,
                                  const torch::Tensor& out) {
@@ -109,6 +137,59 @@ static void combine_reduce_slots(const torch::Tensor& combine_buffer,
     const auto code = CombineReduceSlotsRuntime::generate(args);
     const auto runtime = compiler->build("combine_reduce_slots", code);
     CombineReduceSlotsRuntime::launch(runtime, args);
+}
+
+static void combine_reduce_slots_fp8(const torch::Tensor& combine_buffer,
+                                     const torch::Tensor& combine_scales,
+                                     const torch::Tensor& topk_scores,
+                                     const torch::Tensor& out) {
+    DG_HOST_ASSERT(combine_buffer.is_cuda() and combine_buffer.is_contiguous());
+    DG_HOST_ASSERT(combine_scales.is_cuda() and combine_scales.is_contiguous());
+    DG_HOST_ASSERT(topk_scores.is_cuda() and topk_scores.is_contiguous());
+    DG_HOST_ASSERT(out.is_cuda() and out.is_contiguous());
+    DG_HOST_ASSERT(combine_buffer.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(combine_scales.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(topk_scores.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(out.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(combine_buffer.dim() == 3);
+    DG_HOST_ASSERT(combine_scales.dim() == 3);
+    DG_HOST_ASSERT(topk_scores.dim() == 2);
+    DG_HOST_ASSERT(out.dim() == 2);
+
+    const auto tokens64 = combine_buffer.size(0);
+    const auto top_k64 = combine_buffer.size(1);
+    const auto n64 = combine_buffer.size(2);
+    DG_HOST_ASSERT(tokens64 >= 0 and tokens64 <= std::numeric_limits<uint32_t>::max());
+    DG_HOST_ASSERT(top_k64 > 0 and top_k64 <= std::numeric_limits<uint32_t>::max());
+    DG_HOST_ASSERT(n64 > 0 and n64 <= std::numeric_limits<uint32_t>::max());
+    DG_HOST_ASSERT(n64 % 32 == 0);
+    DG_HOST_ASSERT(combine_scales.size(0) == tokens64);
+    DG_HOST_ASSERT(combine_scales.size(1) == top_k64);
+    DG_HOST_ASSERT(combine_scales.size(2) == n64 / 32);
+    DG_HOST_ASSERT(topk_scores.size(0) >= tokens64);
+    DG_HOST_ASSERT(topk_scores.size(1) >= top_k64);
+    DG_HOST_ASSERT(out.size(0) == tokens64 and out.size(1) == n64);
+
+    constexpr int num_threads = 256;
+    DG_HOST_ASSERT(tokens64 <= std::numeric_limits<int>::max());
+    DG_HOST_ASSERT(top_k64 <= num_threads);
+    const int cols_per_thread = 2;
+    const int block_n = num_threads * cols_per_thread;
+    const int num_col_blocks = static_cast<int>(ceil_div<int64_t>(n64, block_n));
+    const auto args = CombineReduceSlotsFP8Runtime::Args{
+        .combine_buffer = combine_buffer.data_ptr(),
+        .combine_scales = combine_scales.data_ptr(),
+        .topk_scores = topk_scores.data_ptr(),
+        .out = out.data_ptr(),
+        .tokens_per_rank = static_cast<uint32_t>(tokens64),
+        .top_k = static_cast<uint32_t>(top_k64),
+        .n = static_cast<uint32_t>(n64),
+        .cols_per_thread = static_cast<uint32_t>(cols_per_thread),
+        .launch_args = LaunchArgs({static_cast<int>(tokens64), num_col_blocks}, num_threads),
+    };
+    const auto code = CombineReduceSlotsFP8Runtime::generate(args);
+    const auto runtime = compiler->build("combine_reduce_slots_fp8", code);
+    CombineReduceSlotsFP8Runtime::launch(runtime, args);
 }
 
 static void combine_pack_for_reduce_scatter(const torch::Tensor& d_ref,

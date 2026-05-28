@@ -484,6 +484,9 @@ static void register_apis(pybind11::module_& m) {
     m.def("combine_reduce_slots", &combine_reduce_slots,
           pybind11::arg("combine_buffer"), pybind11::arg("topk_scores"),
           pybind11::arg("out"));
+    m.def("combine_reduce_slots_fp8", &combine_reduce_slots_fp8,
+          pybind11::arg("combine_buffer"), pybind11::arg("combine_scales"),
+          pybind11::arg("topk_scores"), pybind11::arg("out"));
     m.def("combine_pack_for_reduce_scatter", &combine_pack_for_reduce_scatter,
           pybind11::arg("d_ref"), pybind11::arg("gather_index"),
           pybind11::arg("row_to_topk"), pybind11::arg("topk_scores"),
