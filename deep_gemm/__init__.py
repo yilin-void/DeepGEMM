@@ -83,6 +83,7 @@ try:
         check_combine_scatter_output,
         combine_scatter_copy_rows,
         combine_reduce_slots,
+        combine_reduce_slots_fp8,
         combine_pack_for_reduce_scatter,
         single_node_allgather_copy_local,
         single_node_allgather_pull,

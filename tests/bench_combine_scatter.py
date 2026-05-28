@@ -64,6 +64,20 @@ def _make_wgmma_n32_physical_to_logical_index(n: int, device: torch.device) -> t
     return (tile_base + in_tile_logical.unsqueeze(0)).reshape(-1).to(torch.long)
 
 
+def _make_wgmma_n64_physical_to_logical_index(n: int, device: torch.device) -> torch.Tensor:
+    if n % 64 != 0:
+        raise ValueError(f'N must be divisible by 64 for FP8 WGMMA N permutation, got {n}')
+    in_tile_physical = torch.arange(64, device=device)
+    half = in_tile_physical // 32
+    in_half = in_tile_physical % 32
+    pair = in_half // 8
+    lane_group = (in_half % 8) // 2
+    elem = in_half % 2
+    in_tile_logical = lane_group * 16 + half * 8 + pair * 2 + elem
+    tile_base = torch.arange(0, n, 64, device=device).unsqueeze(1)
+    return (tile_base + in_tile_logical.unsqueeze(0)).reshape(-1).to(torch.long)
+
+
 def _build_compact_gemm2_layout(routing_topk: torch.Tensor,
                                 rank: int,
                                 num_ranks: int,
@@ -190,7 +204,8 @@ def _build_cpu_combine_reference(d_ref: torch.Tensor,
                                  top_k: int,
                                  num_ranks: int,
                                  ref_tokens: int,
-                                 group: dist.ProcessGroup) -> torch.Tensor:
+                                 group: dist.ProcessGroup,
+                                 fp8_scale_group_n: int = 0) -> torch.Tensor:
     d_cpu = d_ref.detach().cpu()
     gather_cpu = combine_src_index.detach().cpu().to(torch.int64)
     row_topk_cpu = row_to_topk.detach().cpu().to(torch.int64)
@@ -217,7 +232,19 @@ def _build_cpu_combine_reference(d_ref: torch.Tensor,
             rows.tolist(), src_tokens.tolist(), src_ranks.tolist(),
             local_tokens.tolist(), topk_slots.tolist()):
         score = float(scores_cpu[src_token, topk_slot])
-        partial[src_rank, local_token].add_(d_cpu[row].float(), alpha=score)
+        row_value = d_cpu[row].float()
+        if fp8_scale_group_n > 0:
+            row_value = row_value.clone()
+            for col in range(0, n, fp8_scale_group_n):
+                chunk = row_value[col:col + fp8_scale_group_n]
+                amax = float(chunk.abs().max().item())
+                if amax == 0.0:
+                    row_value[col:col + fp8_scale_group_n] = 0.0
+                    continue
+                scale = amax / 448.0
+                row_value[col:col + fp8_scale_group_n] = (
+                    (chunk / scale).to(torch.float8_e4m3fn).float() * scale)
+        partial[src_rank, local_token].add_(row_value, alpha=score)
 
     partial_gpu = partial.cuda()
     dist.all_reduce(partial_gpu, op=dist.ReduceOp.SUM, group=group)
@@ -333,8 +360,13 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     b_bf16 = torch.randn((num_experts, n_eff, hidden), dtype=torch.bfloat16, device='cuda')
     n_physical_to_logical = None
     if args.combine_scatter_direct_accum_stg:
-        _rank0_print(rank, 'Permuting B within each 32-wide N chunk for direct accumulator stores...')
-        n_physical_to_logical = _make_wgmma_n32_physical_to_logical_index(n_eff, b_bf16.device)
+        perm_n = 64 if args.combine_scatter_fp8 else 32
+        _rank0_print(rank, f'Permuting B within each {perm_n}-wide N chunk for direct accumulator stores...')
+        n_physical_to_logical = (
+            _make_wgmma_n64_physical_to_logical_index(n_eff, b_bf16.device)
+            if args.combine_scatter_fp8
+            else _make_wgmma_n32_physical_to_logical_index(n_eff, b_bf16.device)
+        )
         b_bf16 = b_bf16.index_select(1, n_physical_to_logical).contiguous()
     b_fp8 = grouped_cast_fp8_fp4_with_major(
         b_bf16, MajorTypeAB.KMajor, quant_config.gran_k_b,
@@ -356,12 +388,38 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     local_topk_scores = combine_topk_scores[
         rank * tokens_per_rank:(rank + 1) * tokens_per_rank, :combine_top_k].contiguous()
 
+    combine_dtype = torch.float8_e4m3fn if args.combine_scatter_fp8 else torch.bfloat16
     combine_buffer = torch.empty((tokens_per_rank, combine_top_k, n_eff),
-                                 dtype=torch.bfloat16, device='cuda')
+                                 dtype=combine_dtype, device='cuda')
+    combine_scales = None
+    combine_scale_ptrs_t = None
+    if args.combine_scatter_fp8:
+        combine_scales = torch.empty((tokens_per_rank, combine_top_k, n_eff // 32),
+                                     dtype=torch.float32, device='cuda')
     combine_handles = [None] * num_ranks
     dist.all_gather_object(combine_handles, deep_gemm.cuda_ipc_get_mem_handle(combine_buffer), group=group)
     combine_buffer_ptrs = deep_gemm.cuda_ipc_open_mem_handles(combine_handles, rank, combine_buffer)
+    if args.combine_scatter_fp8:
+        combine_scale_handles = [None] * num_ranks
+        dist.all_gather_object(combine_scale_handles, deep_gemm.cuda_ipc_get_mem_handle(combine_scales), group=group)
+        combine_scale_ptrs = deep_gemm.cuda_ipc_open_mem_handles(combine_scale_handles, rank, combine_scales)
+    if args.combine_scatter_local_buffer:
+        _rank0_print(rank, 'Redirecting combine-scatter stores to a local mirror buffer...')
+        local_scatter_buffer = torch.empty((num_ranks, tokens_per_rank, combine_top_k, n_eff),
+                                           dtype=combine_dtype, device='cuda')
+        base_ptr = int(local_scatter_buffer.data_ptr())
+        rank_stride_bytes = local_scatter_buffer.stride(0) * local_scatter_buffer.element_size()
+        combine_buffer_ptrs = [base_ptr + src_rank * rank_stride_bytes for src_rank in range(num_ranks)]
+        if args.combine_scatter_fp8:
+            local_scatter_scales = torch.empty((num_ranks, tokens_per_rank, combine_top_k, n_eff // 32),
+                                               dtype=torch.float32, device='cuda')
+            scale_base_ptr = int(local_scatter_scales.data_ptr())
+            scale_rank_stride_bytes = local_scatter_scales.stride(0) * local_scatter_scales.element_size()
+            combine_scale_ptrs = [
+                scale_base_ptr + src_rank * scale_rank_stride_bytes for src_rank in range(num_ranks)]
     combine_buffer_ptrs_t = torch.tensor(combine_buffer_ptrs, dtype=torch.int64, device='cuda')
+    if args.combine_scatter_fp8:
+        combine_scale_ptrs_t = torch.tensor(combine_scale_ptrs, dtype=torch.int64, device='cuda')
 
     reduce_scatter_input = None
     reduce_scatter_output = None
@@ -384,7 +442,10 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                       combine_buffer_ptrs=combine_buffer_ptrs_t,
                       combine_tokens_per_rank=tokens_per_rank,
                       combine_top_k=combine_top_k,
-                      combine_scatter_direct_accum_stg=args.combine_scatter_direct_accum_stg)
+                      combine_scatter_direct_accum_stg=args.combine_scatter_direct_accum_stg,
+                      combine_scatter_fp8=args.combine_scatter_fp8)
+            if args.combine_scatter_fp8:
+                kw.update(combine_scale_ptrs=combine_scale_ptrs_t)
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             (a_pool, sfa_global), b_fp8, d, psum_layout,
             recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
@@ -464,7 +525,11 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
 
     def run_local_reduce_only() -> None:
         with torch.cuda.stream(compute_stream):
-            deep_gemm.combine_reduce_slots(combine_buffer, local_topk_scores, fused_reduce_output)
+            if args.combine_scatter_fp8:
+                deep_gemm.combine_reduce_slots_fp8(
+                    combine_buffer, combine_scales, local_topk_scores, fused_reduce_output)
+            else:
+                deep_gemm.combine_reduce_slots(combine_buffer, local_topk_scores, fused_reduce_output)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
     def run_fused_scatter_then_local_reduce() -> None:
@@ -486,7 +551,8 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         dist.barrier(group=group)
 
         def check_scatter_output(label: str, fn) -> None:
-            combine_buffer.fill_(float('nan'))
+            if not args.combine_scatter_fp8:
+                combine_buffer.fill_(float('nan'))
             torch.cuda.synchronize()
             dist.barrier(group=group)
             fn()
@@ -509,9 +575,12 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                     f'{label} mismatch: count={mismatch_count}, max_abs_diff={max_diff}')
             _rank0_print(rank, f'{label} value check passed: max_abs_diff=0, mismatches=0')
 
-        check_scatter_output('Fused combine-scatter epilogue', run_fused_scatter)
-        if args.bench_standalone_scatter:
-            check_scatter_output('Standalone scatter-copy', run_standalone_scatter)
+        if args.combine_scatter_fp8:
+            _rank0_print(rank, 'Skipping exact raw scatter check for FP8 combine-scatter.')
+        else:
+            check_scatter_output('Fused combine-scatter epilogue', run_fused_scatter)
+            if args.bench_standalone_scatter:
+                check_scatter_output('Standalone scatter-copy', run_standalone_scatter)
 
         cpu_ref_tokens = tokens_per_rank if args.cpu_ref_tokens < 0 else min(args.cpu_ref_tokens, tokens_per_rank)
         cpu_reference = None
@@ -526,7 +595,8 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                 d_for_cpu_ref[:, n_physical_to_logical] = d
             cpu_reference = _build_cpu_combine_reference(
                 d_for_cpu_ref, combine_src_index, row_to_topk, combine_topk_scores,
-                tokens_per_rank, combine_top_k, num_ranks, cpu_ref_tokens, group)
+                tokens_per_rank, combine_top_k, num_ranks, cpu_ref_tokens, group,
+                fp8_scale_group_n=32 if args.combine_scatter_fp8 else 0)
             torch.cuda.synchronize()
             dist.barrier(group=group)
 
@@ -535,11 +605,12 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             run_fused_scatter()
             torch.cuda.synchronize()
             dist.barrier(group=group)
-            combine_nonfinite_count_t = (~torch.isfinite(combine_buffer)).sum().reshape(1)
-            dist.all_reduce(combine_nonfinite_count_t, op=dist.ReduceOp.SUM, group=group)
-            combine_nonfinite_count = int(combine_nonfinite_count_t.item())
-            if combine_nonfinite_count != 0:
-                raise AssertionError(f'Fused combine buffer has non-finite values: count={combine_nonfinite_count}')
+            if not args.combine_scatter_fp8:
+                combine_nonfinite_count_t = (~torch.isfinite(combine_buffer)).sum().reshape(1)
+                dist.all_reduce(combine_nonfinite_count_t, op=dist.ReduceOp.SUM, group=group)
+                combine_nonfinite_count = int(combine_nonfinite_count_t.item())
+                if combine_nonfinite_count != 0:
+                    raise AssertionError(f'Fused combine buffer has non-finite values: count={combine_nonfinite_count}')
             run_local_reduce_only()
             torch.cuda.synchronize()
             dist.barrier(group=group)
@@ -703,7 +774,8 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         print(f'  m_logical={m_logical}, n={args.n}, num_weights={args.num_weights}, n_eff={n_eff}', flush=True)
         layout_name = f'compact-gemm2/{args.compact_layout_order}' if use_compact_gemm2_layout else 'rank-padded'
         print(f'  gather_a={not args.no_gather_a}, layout={layout_name}, '
-              f'direct_accum_stg={args.combine_scatter_direct_accum_stg}', flush=True)
+              f'direct_accum_stg={args.combine_scatter_direct_accum_stg}, '
+              f'fp8_scatter={args.combine_scatter_fp8}', flush=True)
         if args.bench_reduce_scatter:
             print(f'  nccl_ctas={os.environ["NCCL_MIN_CTAS"]}/{os.environ["NCCL_MAX_CTAS"]}', flush=True)
         print('  common components:', flush=True)
@@ -781,7 +853,13 @@ def main() -> None:
     parser.add_argument('--bench-peer-stg-store', action='store_true',
                         help='Benchmark a row-major no-scatter GEMM whose STG epilogue writes D to a peer rank')
     parser.add_argument('--combine-scatter-direct-accum-stg', action='store_true',
-                        help='Use the N32-permuted direct-accumulator combine-scatter epilogue')
+                        help='Use the direct-accumulator combine-scatter epilogue '
+                             '(BF16 uses N32 B permutation; FP8 uses N64)')
+    parser.add_argument('--combine-scatter-fp8', action='store_true',
+                        help='Use E4M3 FP8 combine-scatter data with FP32 scales per row per 32 columns')
+    parser.add_argument('--combine-scatter-local-buffer', action='store_true',
+                        help='Benchmark-only: redirect combine-scatter destination pointers to local HBM slices '
+                             'instead of peer IPC buffers')
     parser.add_argument('--bench-reduce-scatter', action='store_true',
                         help='Benchmark GEMM + local pack/reduce + NCCL reduce-scatter baseline')
     parser.add_argument('--scatter-rows-per-block', type=int, default=4,
@@ -803,6 +881,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.cpu_ref_tokens < -1:
         raise ValueError('--cpu-ref-tokens must be -1, 0, or a positive integer')
+    if args.combine_scatter_fp8 and not args.combine_scatter_direct_accum_stg:
+        raise ValueError('--combine-scatter-fp8 requires --combine-scatter-direct-accum-stg')
+    if args.combine_scatter_fp8 and args.n % 64 != 0:
+        raise ValueError('--combine-scatter-fp8 requires --n divisible by 64')
 
     if args.bench_reduce_scatter:
         _set_default_nccl_ctas()

@@ -6,6 +6,8 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 
+#include <cuda_fp8.h>
+
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
@@ -161,6 +163,7 @@ template <cute::UMMA::Major kMajorSFB,
           bool kSFAIsMNMajor, bool kHasGatherIndex, bool kHasRankFlags,
           bool kCombineScatter,
           bool kCombineScatterDirectAccumStg,
+          bool kCombineScatterFP8,
           bool kUseTMAStore,
           typename epilogue_type_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
@@ -191,6 +194,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         uint64_t rank_flag_epoch,
                         const int* __restrict__ combine_row_topk,
                         const uint64_t* __restrict__ combine_buffer_ptrs,
+                        const uint64_t* __restrict__ combine_scale_ptrs,
                         uint32_t combine_tokens_per_rank,
                         uint32_t combine_top_k,
                         nv_bfloat16* __restrict__ gmem_d,
@@ -290,6 +294,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     auto smem_tail = reinterpret_cast<uint8_t*>(barrier_start_ptr + 2 * kNumStages);
     auto s_rank_seen = reinterpret_cast<uint32_t*>(smem_tail);
     auto s_combine_scatter_base = reinterpret_cast<uint64_t*>(s_rank_seen + kNumRanksMax);
+    auto s_combine_scatter_scale_base = s_combine_scatter_base + BLOCK_M;
 
 #if DG_BARRIER_DEBUG
     // Diagnose SMEM layout: print offsets and total usage (block 0, thread 0 only).
@@ -645,6 +650,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 for (uint32_t row = threadIdx.x; row < BLOCK_M; row += kNumMathThreads) {
                     const uint32_t logical_m = base_m_idx + row;
                     uint64_t dst_base_u64 = 0;
+                    uint64_t dst_scale_base_u64 = 0;
                     if (logical_m < shape_m) {
                         const int src_token_i = __ldg(combine_src_index + logical_m);
                         const int topk_i = __ldg(combine_row_topk + logical_m);
@@ -659,11 +665,24 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                                 const uint64_t dst_row_offset =
                                     (static_cast<uint64_t>(local_token) * combine_top_k +
                                      static_cast<uint32_t>(topk_i)) * shape_n;
-                                dst_base_u64 = peer_base_u64 + dst_row_offset * sizeof(nv_bfloat16);
+                                if constexpr (kCombineScatterFP8) {
+                                    dst_base_u64 = peer_base_u64 + dst_row_offset * sizeof(__nv_fp8_e4m3);
+                                    const uint64_t peer_scale_base_u64 = __ldg(combine_scale_ptrs + src_rank);
+                                    const uint32_t scale_n = shape_n / 32;
+                                    const uint64_t dst_scale_row_offset =
+                                        (static_cast<uint64_t>(local_token) * combine_top_k +
+                                         static_cast<uint32_t>(topk_i)) * scale_n;
+                                    dst_scale_base_u64 = peer_scale_base_u64 +
+                                        (dst_scale_row_offset + n_block_idx * (BLOCK_N / 32)) * sizeof(float);
+                                } else {
+                                    dst_base_u64 = peer_base_u64 + dst_row_offset * sizeof(nv_bfloat16);
+                                }
                             }
                         }
                     }
                     s_combine_scatter_base[row] = dst_base_u64;
+                    if constexpr (kCombineScatterFP8)
+                        s_combine_scatter_scale_base[row] = dst_scale_base_u64;
                 }
             }
 
@@ -828,6 +847,9 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     DG_STATIC_ASSERT(BLOCK_N % kScatterVecElems == 0, "Invalid vectorized scatter store shape");
                     constexpr uint32_t kDirectStoreGroupCols = 32;
                     constexpr uint32_t kDirectVecsPerRow = BLOCK_N / kDirectStoreGroupCols;
+                    constexpr uint32_t kFP8ScatterVecElems = 16;
+                    constexpr uint32_t kFP8DirectStoreGroupCols = 64;
+                    constexpr uint32_t kFP8DirectVecsPerRow = BLOCK_N / kFP8DirectStoreGroupCols;
 
                     auto store_vec_direct = [&](nv_bfloat16* dst_base,
                                                 const float* shifted_accum,
@@ -878,7 +900,72 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         }
                     };
 
-                    const uint32_t lane_col_offset = (lane_idx & 3u) * kScatterVecElems;
+                    auto store_vec_direct_fp8 = [&](__nv_fp8_e4m3* dst_base,
+                                                    float* scale_base,
+                                                    const float* shifted_accum,
+                                                    uint32_t row_accum_offset,
+                                                    uint32_t accum_pair_base,
+                                                    uint32_t logical_col,
+                                                    uint32_t scale_idx_base) {
+                        if (dst_base == nullptr or scale_base == nullptr or logical_col >= shape_n)
+                            return;
+
+                        float values[kFP8ScatterVecElems];
+                        #pragma unroll
+                        for (uint32_t pair = 0; pair < kFP8ScatterVecElems / 2; ++pair) {
+                            values[pair * 2 + 0] =
+                                shifted_accum[(accum_pair_base + pair) * 4 + row_accum_offset + 0];
+                            values[pair * 2 + 1] =
+                                shifted_accum[(accum_pair_base + pair) * 4 + row_accum_offset + 1];
+                        }
+
+                        float local_amax = 0.0f;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kFP8ScatterVecElems; ++i)
+                            local_amax = cute::max(local_amax, fabsf(values[i]));
+                        float group_amax = local_amax;
+                        const uint32_t lane_pair_mask = 0x3u << (lane_idx & ~1u);
+                        group_amax = cute::max(group_amax, __shfl_xor_sync(lane_pair_mask, group_amax, 1, 2));
+
+                        const float scale = group_amax > 0.0f ? group_amax * (1.0f / 448.0f) : 1.0f;
+                        const float inv_scale = group_amax > 0.0f ? 448.0f / group_amax : 0.0f;
+                        const uint32_t scale_idx = scale_idx_base + ((lane_idx & 2u) >> 1);
+                        if ((lane_idx & 1u) == 0)
+                            scale_base[scale_idx] = scale;
+
+                        const uint32_t dst_col = epilogue_type_t::template apply_index_n<kFP8ScatterVecElems>(logical_col);
+                        if (logical_col + kFP8ScatterVecElems <= shape_n) {
+                            const auto q0 = __nv_fp8x4_e4m3(make_float4(
+                                values[0] * inv_scale, values[1] * inv_scale,
+                                values[2] * inv_scale, values[3] * inv_scale));
+                            const auto q1 = __nv_fp8x4_e4m3(make_float4(
+                                values[4] * inv_scale, values[5] * inv_scale,
+                                values[6] * inv_scale, values[7] * inv_scale));
+                            const auto q2 = __nv_fp8x4_e4m3(make_float4(
+                                values[8] * inv_scale, values[9] * inv_scale,
+                                values[10] * inv_scale, values[11] * inv_scale));
+                            const auto q3 = __nv_fp8x4_e4m3(make_float4(
+                                values[12] * inv_scale, values[13] * inv_scale,
+                                values[14] * inv_scale, values[15] * inv_scale));
+                            const uint32_t packed_u32_0 = *reinterpret_cast<const uint32_t*>(&q0);
+                            const uint32_t packed_u32_1 = *reinterpret_cast<const uint32_t*>(&q1);
+                            const uint32_t packed_u32_2 = *reinterpret_cast<const uint32_t*>(&q2);
+                            const uint32_t packed_u32_3 = *reinterpret_cast<const uint32_t*>(&q3);
+                            asm volatile(
+                                "st.global.v4.u32 [%0], {%1, %2, %3, %4};\n"
+                                :: "l"(dst_base + dst_col),
+                                   "r"(packed_u32_0), "r"(packed_u32_1),
+                                   "r"(packed_u32_2), "r"(packed_u32_3)
+                                : "memory");
+                        } else {
+                            #pragma unroll
+                            for (uint32_t elem = 0; elem < kFP8ScatterVecElems; ++elem) {
+                                if (logical_col + elem < shape_n)
+                                    dst_base[dst_col + elem] = __nv_fp8_e4m3(values[elem] * inv_scale);
+                            }
+                        }
+                    };
+
                     #pragma unroll
                     for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++local_idx) {
                         const uint32_t m_offset = local_idx * WAVE_BLOCK_M;
@@ -887,14 +974,33 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
                         nv_bfloat16* dst_base_0 = reinterpret_cast<nv_bfloat16*>(s_combine_scatter_base[row_0]);
                         nv_bfloat16* dst_base_1 = reinterpret_cast<nv_bfloat16*>(s_combine_scatter_base[row_1]);
+                        auto* dst_fp8_base_0 = reinterpret_cast<__nv_fp8_e4m3*>(s_combine_scatter_base[row_0]);
+                        auto* dst_fp8_base_1 = reinterpret_cast<__nv_fp8_e4m3*>(s_combine_scatter_base[row_1]);
+                        auto* scale_base_0 = reinterpret_cast<float*>(s_combine_scatter_scale_base[row_0]);
+                        auto* scale_base_1 = reinterpret_cast<float*>(s_combine_scatter_scale_base[row_1]);
 
-                        #pragma unroll
-                        for (uint32_t vec = 0; vec < kDirectVecsPerRow; ++vec) {
-                            const uint32_t logical_col =
-                                n_block_idx * BLOCK_N + vec * kDirectStoreGroupCols + lane_col_offset;
-                            const uint32_t accum_pair_base = vec * (kScatterVecElems / 2);
-                            store_vec_direct(dst_base_0, shifted_accum, 0, accum_pair_base, logical_col);
-                            store_vec_direct(dst_base_1, shifted_accum, 2, accum_pair_base, logical_col);
+                        if constexpr (kCombineScatterFP8) {
+                            const uint32_t lane_col_offset = (lane_idx & 3u) * kFP8ScatterVecElems;
+                            #pragma unroll
+                            for (uint32_t vec = 0; vec < kFP8DirectVecsPerRow; ++vec) {
+                                const uint32_t logical_col =
+                                    n_block_idx * BLOCK_N + vec * kFP8DirectStoreGroupCols + lane_col_offset;
+                                const uint32_t accum_pair_base = vec * (kFP8ScatterVecElems / 2);
+                                store_vec_direct_fp8(dst_fp8_base_0, scale_base_0, shifted_accum, 0,
+                                                     accum_pair_base, logical_col, vec * 2);
+                                store_vec_direct_fp8(dst_fp8_base_1, scale_base_1, shifted_accum, 2,
+                                                     accum_pair_base, logical_col, vec * 2);
+                            }
+                        } else {
+                            const uint32_t lane_col_offset = (lane_idx & 3u) * kScatterVecElems;
+                            #pragma unroll
+                            for (uint32_t vec = 0; vec < kDirectVecsPerRow; ++vec) {
+                                const uint32_t logical_col =
+                                    n_block_idx * BLOCK_N + vec * kDirectStoreGroupCols + lane_col_offset;
+                                const uint32_t accum_pair_base = vec * (kScatterVecElems / 2);
+                                store_vec_direct(dst_base_0, shifted_accum, 0, accum_pair_base, logical_col);
+                                store_vec_direct(dst_base_1, shifted_accum, 2, accum_pair_base, logical_col);
+                            }
                         }
                     }
                     continue;
