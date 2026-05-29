@@ -554,6 +554,7 @@ tests/bench_combine_scatter.py
 --combine-scatter-fp8         # 使用 FP8 combine buffer + FP32 scales
 --combine-scatter-local-buffer
                               # 诊断用：把 peer destination 重定向到本地 HBM
+--fp8-debug-precision         # 配合 --check --combine-scatter-fp8 打印 FP8 误差来源诊断
 --scatter-rows-per-block      # standalone scatter-copy 的 rows/CTA，默认 4
 --compact-layout-order        # compact GEMM2 row order：token 或 ring，默认 token
 ```
@@ -711,8 +712,24 @@ mismatches   = 0
 ```
 
 上面的 correctness 是 BF16 path。FP8 path 会引入量化误差，不能和 BF16 CPU
-reference 做 bit-exact 或严格 tolerance 对比；当前性能路径已经跑通，但 FP8 数值
-验收还需要单独定义量化 reference 和误差门限。
+reference 做 bit-exact 或严格 tolerance 对比。当前 benchmark 增加了
+`--fp8-debug-precision`，用于把 FP8 误差拆成 slot 写入、量化本身和 local reduction
+三个层面。该诊断会在 tolerance check 之前打印；如果希望 FP8 `--check` 整体通过，需要
+显式设置符合预期误差范围的 `--reduce-check-rtol/--reduce-check-atol`。
+
+目标 shape 下，`--check --combine-scatter-fp8 --fp8-debug-precision` 的典型输出：
+
+| 对比项 | max abs | mean abs | RMSE | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| local-reduce kernel vs torch reduce(actual slots) | 7.63e-05 | 5.66e-06 | 8.37e-06 | local reduction 实现正确 |
+| CPU quantized slots vs CPU BF16 slots | 5.14 | 0.584 | 0.857 | FP8 per-32 量化本身的误差 |
+| actual dequant slots vs CPU BF16 slots | 5.20 | 0.589 | 0.859 | 和 CPU 量化误差基本一致 |
+| actual reduction vs CPU BF16 reference | 10.09 | 1.603 | 2.038 | reduction 后的端到端 FP8 误差 |
+
+因此当前证据表明，FP8 path 的主要数值差异来自量化本身，而不是 slot layout、peer
+store 或 local reduction 的实现错误。`actual dequant slots vs CPU quantized slots`
+仍有残差，原因是 kernel 从 FP32 accumulator 直接量化，而 CPU diagnostic 用普通
+GEMM 输出 `D` 作为参考，中间包含 BF16 写回/重排和 PyTorch CPU FP8 conversion 的差异。
 
 ### 6.3 解读：BF16、FP8 与 store 粒度
 
@@ -760,15 +777,31 @@ FP8 N64 direct fused scatter event  = 1188.58 us
 快约 `16.6%`。
 
 local-buffer 诊断把 destination pointer table 临时替换成本地 HBM buffer，只用于分离
-本地 quant/store 和远端 peer store 成本：
+本地 store/quantization 和远端 peer store 成本。这个模式是 benchmark 诊断入口，
+不用于 correctness，因为 local reduction 仍然读取正式的 source-rank combine
+buffer。
 
 | 方案 | fused GEMM + scatter event | 说明 |
 | --- | ---: | --- |
 | BF16 N32 remote | 1492.59 us | 正常 peer IPC 写 |
 | FP8 N64 remote | 1188.58 us | 正常 peer IPC 写 |
-| FP8 N64 local-buffer | 965.39 us | 同一 address footprint，但写本地 HBM |
+| BF16 N32 local-buffer | 841.22 us / 830.40 us | 两次长迭代复测，写本地 HBM |
+| FP8 N64 local-buffer | 913.74 us | 同一 address footprint，但写本地 HBM |
 
-因此 FP8 N64 的本地量化和 16B store 形态已经可接受，剩余差距主要来自远端 peer write。
+对应的 no-scatter event 分别为：
+
+| 方案 | GEMM no scatter event | local-buffer fused event | delta |
+| --- | ---: | ---: | ---: |
+| BF16 N32 local-buffer run 1 | 818.94 us | 841.22 us | +22.28 us |
+| BF16 N32 local-buffer run 2 | 780.08 us | 830.40 us | +50.32 us |
+| FP8 N64 local-buffer | 811.09 us | 913.74 us | +102.65 us |
+
+因此 BF16 local-buffer scatter 的 kernel event 开销只有几十微秒量级；如果短迭代里
+wall time 看起来差到 100 us 以上，主要是跨 rank barrier、rank skew 和 benchmark
+block 间抖动。FP8 N64 local-buffer 相比 BF16 多出的部分主要来自 per-32 amax/scale
+计算、FP8 conversion、FP8 data store 和 FP32 scale store。远端 peer write 仍是 remote
+path 的主瓶颈：把 FP8 N64 从 local-buffer 改回 remote 后，fused event 从
+`913.74 us` 增加到 `1188.58 us`。
 
 ### 6.4 K sweep 与计算/通信 overlap 模型
 
@@ -1005,9 +1038,10 @@ accum_pair_base = vec * 4;
 | N128 direct peer scatter（已撤回） | 4626.54 us (event 4591.52 us) | 206.60 us (event 163.52 us) | 4837.86 us |
 | N32 direct peer scatter（当前保留） | 1545.07 us (event 1492.58 us) | 205.77 us (event 163.07 us) | 1781.66 us |
 
-local-buffer 诊断把 peer pointer table 临时替换为本地 buffer，早期 BF16 N32 结果为
-`851.18 us wall / 806.53 us event`。该诊断说明 N32 direct epilogue 的本地写回开销
-已经接近 no-scatter GEMM，当前大头仍是 peer store。这个诊断入口现在保留为
+local-buffer 诊断把 peer pointer table 临时替换为本地 buffer。长迭代复测中 BF16 N32
+local-buffer fused event 为 `830.40 us` 到 `841.22 us`，对应 no-scatter event 为
+`780.08 us` 到 `818.94 us`。该诊断说明 N32 direct epilogue 的本地写回开销已经接近
+no-scatter GEMM，当前大头仍是 peer store。这个诊断入口现在保留为
 `--combine-scatter-local-buffer`，用于后续分离本地 store/quantization 和远端 peer
 store 成本。
 
@@ -1066,9 +1100,10 @@ FP8 path 则写入 FP8 combine buffer 和 FP32 scale buffer，local reduction �
 和 reduction 仍然是两个 kernel。FP8 local reduction 多读 scale，多一次反量化，因此比
 BF16 reduction 慢约 `23 us` event。
 
-FP8 数值验证仍需单独完善。当前 CPU reference 可以模拟每 32 列 scale 的 FP8 量化，但
-小 shape 下用严格 `rtol=0.1, atol=0.2` 仍有少量 mismatch；在正式使用前应根据模型可接受
-误差确定 reference 和 tolerance。
+FP8 数值验证已经有初步拆解：`--fp8-debug-precision` 会比较 actual FP8 slot 反量化、
+CPU per-32 FP8 quantized slot、CPU BF16 slot，以及 actual reduction。现有结果说明
+slot 写入和 local reduction 没有明显实现错误，主要误差来自 FP8 量化本身。正式接入前
+仍需要根据模型容忍度确定 FP8 combine 的 reference、scale 粒度和 acceptance threshold。
 
 ### 7.2 可能的优化方向
 
@@ -1085,10 +1120,11 @@ FP8 数值验证仍需单独完善。当前 CPU reference 可以模拟每 32 列
    fused scatter 的主瓶颈。后续应继续关注 peer-store 指令形态、store 粒度、写入合并
    以及 epilogue 内等待和同步成本。
 
-3. **补齐 FP8 correctness**
+3. **确定 FP8 correctness gate**
 
-   性能路径已经验证，但 FP8 量化引入了真实数值误差。需要明确 per-32 scale 的误差
-   目标，或评估 per-token/per-128 scale 等其他粒度，再确定正式 correctness gate。
+   性能路径和诊断路径已经能把误差拆到 slot、quantization 和 reduction 层面，但 FP8
+   量化引入了真实数值误差。需要明确 per-32 scale 的误差目标，或评估 per-token/per-128
+   scale 等其他粒度，再确定正式 correctness gate。
 
 4. **暂不优先推进 row-major TMA intermediate**
 
