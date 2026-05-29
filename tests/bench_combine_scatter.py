@@ -196,6 +196,45 @@ def _max_across_ranks(value: float, group: dist.ProcessGroup) -> float:
     return float(t.item())
 
 
+def _quantize_cpu_row_per_group(row_value: torch.Tensor, group_n: int) -> torch.Tensor:
+    row_value = row_value.float().clone()
+    n = int(row_value.numel())
+    for col in range(0, n, group_n):
+        chunk = row_value[col:col + group_n]
+        amax = float(chunk.abs().max().item())
+        if amax == 0.0:
+            row_value[col:col + group_n] = 0.0
+            continue
+        scale = amax / 448.0
+        row_value[col:col + group_n] = (
+            (chunk / scale).to(torch.float8_e4m3fn).float() * scale)
+    return row_value
+
+
+def _select_cpu_reference_rows(combine_src_index: torch.Tensor,
+                               row_to_topk: torch.Tensor,
+                               tokens_per_rank: int,
+                               top_k: int,
+                               num_ranks: int,
+                               ref_tokens: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                                          torch.Tensor, torch.Tensor]:
+    gather_cpu = combine_src_index.detach().cpu().to(torch.int64)
+    row_topk_cpu = row_to_topk.detach().cpu().to(torch.int64)
+
+    valid = (gather_cpu >= 0) & (row_topk_cpu >= 0) & (row_topk_cpu < top_k)
+    valid &= gather_cpu < tokens_per_rank * num_ranks
+    rows = torch.nonzero(valid, as_tuple=False).flatten()
+
+    src_tokens = gather_cpu[rows]
+    topk_slots = row_topk_cpu[rows]
+    src_ranks = torch.div(src_tokens, tokens_per_rank, rounding_mode='floor')
+    local_tokens = src_tokens - src_ranks * tokens_per_rank
+    in_sample = local_tokens < ref_tokens
+
+    return (rows[in_sample], src_tokens[in_sample], src_ranks[in_sample],
+            local_tokens[in_sample], topk_slots[in_sample])
+
+
 def _build_cpu_combine_reference(d_ref: torch.Tensor,
                                  combine_src_index: torch.Tensor,
                                  row_to_topk: torch.Tensor,
@@ -207,26 +246,12 @@ def _build_cpu_combine_reference(d_ref: torch.Tensor,
                                  group: dist.ProcessGroup,
                                  fp8_scale_group_n: int = 0) -> torch.Tensor:
     d_cpu = d_ref.detach().cpu()
-    gather_cpu = combine_src_index.detach().cpu().to(torch.int64)
-    row_topk_cpu = row_to_topk.detach().cpu().to(torch.int64)
     scores_cpu = topk_scores.detach().cpu()
 
     n = int(d_cpu.size(1))
     partial = torch.zeros((num_ranks, ref_tokens, n), dtype=torch.float32, device='cpu')
-
-    valid = (gather_cpu >= 0) & (row_topk_cpu >= 0) & (row_topk_cpu < top_k)
-    valid &= gather_cpu < tokens_per_rank * num_ranks
-    src_tokens = gather_cpu[valid]
-    rows = torch.nonzero(valid, as_tuple=False).flatten()
-    src_ranks = torch.div(src_tokens, tokens_per_rank, rounding_mode='floor')
-    local_tokens = src_tokens - src_ranks * tokens_per_rank
-    in_sample = local_tokens < ref_tokens
-
-    rows = rows[in_sample]
-    src_tokens = src_tokens[in_sample]
-    src_ranks = src_ranks[in_sample]
-    local_tokens = local_tokens[in_sample]
-    topk_slots = row_topk_cpu[valid][in_sample]
+    rows, src_tokens, src_ranks, local_tokens, topk_slots = _select_cpu_reference_rows(
+        combine_src_index, row_to_topk, tokens_per_rank, top_k, num_ranks, ref_tokens)
 
     for row, src_token, src_rank, local_token, topk_slot in zip(
             rows.tolist(), src_tokens.tolist(), src_ranks.tolist(),
@@ -234,21 +259,66 @@ def _build_cpu_combine_reference(d_ref: torch.Tensor,
         score = float(scores_cpu[src_token, topk_slot])
         row_value = d_cpu[row].float()
         if fp8_scale_group_n > 0:
-            row_value = row_value.clone()
-            for col in range(0, n, fp8_scale_group_n):
-                chunk = row_value[col:col + fp8_scale_group_n]
-                amax = float(chunk.abs().max().item())
-                if amax == 0.0:
-                    row_value[col:col + fp8_scale_group_n] = 0.0
-                    continue
-                scale = amax / 448.0
-                row_value[col:col + fp8_scale_group_n] = (
-                    (chunk / scale).to(torch.float8_e4m3fn).float() * scale)
+            row_value = _quantize_cpu_row_per_group(row_value, fp8_scale_group_n)
         partial[src_rank, local_token].add_(row_value, alpha=score)
 
     partial_gpu = partial.cuda()
     dist.all_reduce(partial_gpu, op=dist.ReduceOp.SUM, group=group)
     return partial_gpu[dist.get_rank(group)].contiguous()
+
+
+def _build_cpu_slot_reference(d_ref: torch.Tensor,
+                              combine_src_index: torch.Tensor,
+                              row_to_topk: torch.Tensor,
+                              tokens_per_rank: int,
+                              top_k: int,
+                              num_ranks: int,
+                              ref_tokens: int,
+                              group: dist.ProcessGroup,
+                              fp8_scale_group_n: int = 0) -> torch.Tensor:
+    d_cpu = d_ref.detach().cpu()
+
+    n = int(d_cpu.size(1))
+    partial = torch.zeros((num_ranks, ref_tokens, top_k, n), dtype=torch.float32, device='cpu')
+    rows, _src_tokens, src_ranks, local_tokens, topk_slots = _select_cpu_reference_rows(
+        combine_src_index, row_to_topk, tokens_per_rank, top_k, num_ranks, ref_tokens)
+
+    for row, src_rank, local_token, topk_slot in zip(
+            rows.tolist(), src_ranks.tolist(), local_tokens.tolist(), topk_slots.tolist()):
+        row_value = d_cpu[row].float()
+        if fp8_scale_group_n > 0:
+            row_value = _quantize_cpu_row_per_group(row_value, fp8_scale_group_n)
+        partial[src_rank, local_token, topk_slot].copy_(row_value)
+
+    partial_gpu = partial.cuda()
+    dist.all_reduce(partial_gpu, op=dist.ReduceOp.SUM, group=group)
+    return partial_gpu[dist.get_rank(group)].contiguous()
+
+
+def _print_error_stats(label: str,
+                       actual: torch.Tensor,
+                       reference: torch.Tensor,
+                       group: dist.ProcessGroup) -> None:
+    diff = (actual - reference).float()
+    abs_diff = diff.abs()
+    ref_abs = reference.float().abs()
+    max_abs_t = abs_diff.max().reshape(1)
+    sum_abs_t = abs_diff.sum(dtype=torch.float64).reshape(1)
+    sum_sq_t = diff.square().sum(dtype=torch.float64).reshape(1)
+    max_ref_t = ref_abs.max().reshape(1)
+    count_t = torch.tensor([actual.numel()], dtype=torch.float64, device=actual.device)
+    dist.all_reduce(max_abs_t, op=dist.ReduceOp.MAX, group=group)
+    dist.all_reduce(sum_abs_t, op=dist.ReduceOp.SUM, group=group)
+    dist.all_reduce(sum_sq_t, op=dist.ReduceOp.SUM, group=group)
+    dist.all_reduce(max_ref_t, op=dist.ReduceOp.MAX, group=group)
+    dist.all_reduce(count_t, op=dist.ReduceOp.SUM, group=group)
+    if dist.get_rank(group) == 0:
+        count = float(count_t.item())
+        mean_abs = float(sum_abs_t.item() / count)
+        rmse = (float(sum_sq_t.item() / count)) ** 0.5
+        print(f'  {label}: max_abs={float(max_abs_t.item()):.6g}, '
+              f'mean_abs={mean_abs:.6g}, rmse={rmse:.6g}, '
+              f'max_ref_abs={float(max_ref_t.item()):.6g}', flush=True)
 
 
 def _check_against_reference(label: str,
@@ -614,6 +684,37 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             run_local_reduce_only()
             torch.cuda.synchronize()
             dist.barrier(group=group)
+
+            if args.combine_scatter_fp8 and args.fp8_debug_precision:
+                _rank0_print(rank, 'FP8 precision diagnostics:')
+                cpu_unquant_reference = _build_cpu_combine_reference(
+                    d_for_cpu_ref, combine_src_index, row_to_topk, combine_topk_scores,
+                    tokens_per_rank, combine_top_k, num_ranks, cpu_ref_tokens, group)
+                cpu_quant_slots = _build_cpu_slot_reference(
+                    d_for_cpu_ref, combine_src_index, row_to_topk,
+                    tokens_per_rank, combine_top_k, num_ranks, cpu_ref_tokens, group,
+                    fp8_scale_group_n=32)
+                cpu_bf16_slots = _build_cpu_slot_reference(
+                    d_for_cpu_ref, combine_src_index, row_to_topk,
+                    tokens_per_rank, combine_top_k, num_ranks, cpu_ref_tokens, group)
+                actual_slots = combine_buffer[:cpu_ref_tokens].float()
+                actual_scales = combine_scales[:cpu_ref_tokens].repeat_interleave(32, dim=2)
+                actual_dequant_slots = actual_slots * actual_scales
+                slot_reduce_reference = (
+                    actual_dequant_slots * local_topk_scores[:cpu_ref_tokens, :, None]).sum(dim=1)
+                _print_error_stats('local-reduce-kernel vs torch-reduce(actual slots)',
+                                   fused_reduce_output[:cpu_ref_tokens], slot_reduce_reference, group)
+                _print_error_stats('actual dequant slots vs CPU quantized slots',
+                                   actual_dequant_slots, cpu_quant_slots, group)
+                _print_error_stats('CPU quantized slots vs CPU BF16 slots',
+                                   cpu_quant_slots, cpu_bf16_slots, group)
+                _print_error_stats('actual dequant slots vs CPU BF16 slots',
+                                   actual_dequant_slots, cpu_bf16_slots, group)
+                _print_error_stats('actual reduction vs CPU quantized reference',
+                                   fused_reduce_output[:cpu_ref_tokens], cpu_reference, group)
+                _print_error_stats('actual reduction vs CPU BF16 reference',
+                                   fused_reduce_output[:cpu_ref_tokens], cpu_unquant_reference, group)
+
             max_diff, _ = _check_against_reference(
                 'Fused scatter + local reduction', fused_reduce_output, cpu_reference, group,
                 args.reduce_check_rtol, args.reduce_check_atol)
@@ -878,6 +979,8 @@ def main() -> None:
     parser.add_argument('--warmups', type=int, default=3)
     parser.add_argument('--iters', type=int, default=10)
     parser.add_argument('--check', action='store_true')
+    parser.add_argument('--fp8-debug-precision', action='store_true',
+                        help='With --check and --combine-scatter-fp8, print slot-level quantization diagnostics')
     args = parser.parse_args()
     if args.cpu_ref_tokens < -1:
         raise ValueError('--cpu-ref-tokens must be -1, 0, or a positive integer')
@@ -885,6 +988,8 @@ def main() -> None:
         raise ValueError('--combine-scatter-fp8 requires --combine-scatter-direct-accum-stg')
     if args.combine_scatter_fp8 and args.n % 64 != 0:
         raise ValueError('--combine-scatter-fp8 requires --n divisible by 64')
+    if args.fp8_debug_precision and (not args.check or not args.combine_scatter_fp8):
+        raise ValueError('--fp8-debug-precision requires --check and --combine-scatter-fp8')
 
     if args.bench_reduce_scatter:
         _set_default_nccl_ctas()
