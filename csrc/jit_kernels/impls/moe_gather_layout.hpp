@@ -41,7 +41,7 @@ class GatherLayoutHistogramRuntime final : public LaunchRuntime<GatherLayoutHist
 public:
     struct Args {
         void *routing_topk, *counts;
-        uint32_t T, K, num_experts, num_ranks, tokens_per_rank;
+        uint32_t T, K, num_experts, num_ranks, tokens_per_rank, expert_base;
         LaunchArgs launch_args;
     };
 
@@ -60,7 +60,8 @@ static void __instantiate_kernel() {{
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.routing_topk, args.counts,
-            args.T, args.K, args.num_experts, args.num_ranks, args.tokens_per_rank));
+            args.T, args.K, args.num_experts, args.num_ranks, args.tokens_per_rank,
+            args.expert_base));
     }
 };
 
@@ -128,7 +129,8 @@ class GatherLayoutScatterRuntime final : public LaunchRuntime<GatherLayoutScatte
 public:
     struct Args {
         void *routing_topk, *padded_starts, *chunk_cursor, *gather_index, *row_to_topk;
-        uint32_t T, K, local_rank, num_experts, num_ranks, tokens_per_rank, topk_slot_offset;
+        uint32_t T, K, local_rank, num_experts, num_ranks, tokens_per_rank, topk_slot_offset,
+                 expert_base;
         LaunchArgs launch_args;
     };
 
@@ -148,7 +150,7 @@ static void __instantiate_kernel() {{
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.routing_topk, args.padded_starts, args.chunk_cursor, args.gather_index, args.row_to_topk,
             args.T, args.K, args.local_rank, args.num_experts, args.num_ranks,
-            args.tokens_per_rank, args.topk_slot_offset));
+            args.tokens_per_rank, args.topk_slot_offset, args.expert_base));
     }
 };
 
@@ -211,6 +213,12 @@ build_gather_layout_for_rank_overlap(
     DG_HOST_ASSERT(T == num_ranks * tokens_per_rank);
     DG_HOST_ASSERT(K > 0);
 
+    // routing_topk values are GLOBAL expert ids; this rank owns the contiguous
+    // block [expert_base, expert_base + num_experts). Phase 1/3 map global ->
+    // local via this base and drop experts on other ranks.
+    const uint32_t expert_base = static_cast<uint32_t>(local_rank) *
+                                 static_cast<uint32_t>(num_experts);
+
     // Allocate outputs and aux buffers on the input device.
     const auto opts_int32 = at::TensorOptions().dtype(torch::kInt).device(routing_topk.device());
 
@@ -259,6 +267,7 @@ build_gather_layout_for_rank_overlap(
             .num_experts = static_cast<uint32_t>(num_experts),
             .num_ranks = static_cast<uint32_t>(num_ranks),
             .tokens_per_rank = static_cast<uint32_t>(tokens_per_rank),
+            .expert_base = expert_base,
             .launch_args = LaunchArgs(num_blocks, num_threads),
         };
         const auto code = GatherLayoutHistogramRuntime::generate(args);
@@ -336,6 +345,7 @@ build_gather_layout_for_rank_overlap(
             .num_ranks = static_cast<uint32_t>(num_ranks),
             .tokens_per_rank = static_cast<uint32_t>(tokens_per_rank),
             .topk_slot_offset = static_cast<uint32_t>(topk_slot_offset),
+            .expert_base = expert_base,
             .launch_args = LaunchArgs(num_blocks, num_threads),
         };
         const auto code = GatherLayoutScatterRuntime::generate(args);

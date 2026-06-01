@@ -12,6 +12,9 @@ Default config matches the user's request:
 
 Run:
     python tests/bench_gather_layout_generator.py
+
+cd /home/guanrui03/cursor/moe/MoE_DeepGEMM_Combine/DeepGEMM
+PYTHONPATH=$PWD python tests/bench_gather_layout_generator.py
 """
 
 import argparse
@@ -88,8 +91,15 @@ def bench_one(num_ranks: int, tokens_per_rank: int, top_k: int,
     if local_ranks is None:
         local_ranks = [0]
 
+    # `num_experts` here is the GLOBAL expert count; the API takes the per-rank
+    # (local) count and maps global ids internally.
+    num_local_experts = num_experts // num_ranks
+    assert num_local_experts > 0, \
+        f'num_experts({num_experts}) must be >= num_ranks({num_ranks})'
+
     # One routing topk shared across local_ranks (Phase 1/3 only depend on the
     # topk; Phase 2 outputs depend on `local_rank` but the *cost* doesn't).
+    # Values are GLOBAL expert ids drawn from the full pool of `num_experts`.
     torch.manual_seed(0xc0ffee)
     routing_topk = _generate_routing_topk(T, top_k, num_experts, seed=0xfade)
 
@@ -98,13 +108,14 @@ def bench_one(num_ranks: int, tokens_per_rank: int, top_k: int,
     # doc). `T*K` is the exact upper bound on Σ n_real (sum of real-row chunk
     # sizes); each non-empty chunk contributes ≤ block_m-1 pad rows on top.
     total_pairs = T * top_k
-    num_chunks = num_experts * num_ranks
+    num_chunks = num_local_experts * num_ranks
     M_max = total_pairs + min(num_chunks, total_pairs) * (block_m - 1)
-    M_max_loose = num_experts * num_ranks * \
+    M_max_loose = num_local_experts * num_ranks * \
         (((tokens_per_rank + block_m - 1) // block_m) * block_m)
 
     print(f'  T = {T} ({num_ranks} × {tokens_per_rank}), '
-          f'top_k = {top_k}, num_experts = {num_experts}, block_m = {block_m}')
+          f'top_k = {top_k}, num_experts(global) = {num_experts}, '
+          f'local_experts = {num_local_experts}, block_m = {block_m}')
     print(f'  M_max (tight, allocated) = {M_max:,} '
           f'({M_max * 4 / 1e6:.1f} MB per int32 tensor)')
     print(f'  M_max (loose, OLD bound) = {M_max_loose:,} '
@@ -117,7 +128,7 @@ def bench_one(num_ranks: int, tokens_per_rank: int, top_k: int,
         def fn():
             return deep_gemm.build_gather_layout_for_rank_overlap(
                 routing_topk, local_rank, num_ranks,
-                tokens_per_rank, num_experts, block_m)
+                tokens_per_rank, num_local_experts, block_m)
 
         # First build also reports the actual m_logical for context.
         out = fn()
@@ -184,12 +195,12 @@ def main(argv=None):
         return
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--tokens-per-rank', type=int, default=7351)
+    parser.add_argument('--tokens-per-rank', type=int, default=2*3488)
     parser.add_argument('--num-ranks', type=int, default=8)
     parser.add_argument('--top-k', type=int, default=16)
     parser.add_argument('--num-experts', type=int, default=512)
     parser.add_argument('--block-m', type=int, default=128)
-    parser.add_argument('--num-kineto-tests', type=int, default=30)
+    parser.add_argument('--num-kineto-tests', type=int, default=200)
     parser.add_argument('--all-local-ranks', action='store_true',
                         help='Bench every local_rank in [0, num_ranks). '
                              'By default we only bench local_rank=0 since '
