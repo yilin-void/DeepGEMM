@@ -388,7 +388,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     torch.manual_seed(0x2026)
     a_global_bf16 = torch.randn((total_tokens, hidden), dtype=torch.bfloat16, device='cuda')
 
-    routing_topk = _generate_distinct_routing_topk(total_tokens, local_top_k, num_experts, seed=0xBEEF)
+    routing_topk = _generate_distinct_routing_topk(total_tokens, combine_top_k, args.global_num_experts, seed=0xBEEF)
     use_compact_gemm2_layout = args.no_gather_a and not args.rank_padded_gemm2_layout
     if use_compact_gemm2_layout:
         _rank0_print(rank, f'Building compact GEMM2 layout ({args.compact_layout_order} order)...')
@@ -401,7 +401,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         gather_index, _tile_rank, _grouped_layout, m_logical_t, psum_layout, row_to_topk = \
             deep_gemm.build_gather_layout_for_rank_overlap(
                 routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m,
-                topk_slot_offset=rank * local_top_k)
+                topk_slot_offset=0)
         m_logical = int(m_logical_t.item())
         combine_src_index = gather_index
     expected_m_per_expert = int((m_logical + num_experts - 1) // num_experts * 1.2)
