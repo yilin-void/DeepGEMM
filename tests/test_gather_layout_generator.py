@@ -13,11 +13,14 @@ of the same layout. The two should agree on:
   - `m_logical` (scalar, exact)
   - `tile_rank[: num_m_tiles]` (exact)
   - `grouped_layout[: m_logical]` (exact)
-  - `psum_layout` (exact)
-  - `(gather_index, row_to_topk)[: m_logical]` (pair multiset per
-    (expert, ring-step) chunk; pad rows have value `-1`; the order of real rows
-    within a chunk may differ between GPU and Python because Phase 3 uses
-    `atomicAdd`).
+  - `gather_index[: m_logical]` (multiset per (expert, ring-step) chunk;
+    pad rows have value `-1`; the order of real-row tokens within a chunk
+    may differ between GPU and Python because Phase 3 uses `atomicAdd`).
+
+cd /home/guanrui03/cursor/moe/MoE_DeepGEMM_Combine/DeepGEMM
+PYTHONPATH=$PWD python tests/test_gather_layout_generator.py            # 跑全部 (unit + e2e)
+PYTHONPATH=$PWD python tests/test_gather_layout_generator.py -t unit    # 只跑 unit (layout 逐元素对齐参考)
+PYTHONPATH=$PWD python tests/test_gather_layout_generator.py -t e2e     # 只跑 e2e (generator → grouped GEMM)
 """
 
 import argparse
@@ -58,11 +61,16 @@ def reference_build_gather_layout(routing_topk: torch.Tensor,
     assert T == num_ranks * tokens_per_rank
     rt_cpu = routing_topk.detach().cpu().numpy()
 
+    # routing_topk holds GLOBAL expert ids; this rank owns the contiguous block
+    # [expert_base, expert_base + num_experts). Mirror the kernel's global->local
+    # map + drop-others filter exactly (Phase 1 / Phase 3 stay in lockstep).
+    expert_base = local_rank * num_experts
+
     counts = [[0] * num_ranks for _ in range(num_experts)]  # 每个专家分别从各个rank接收token的个数，shape [num_experts, num_ranks]
     for t in range(T):
         r = t // tokens_per_rank
         for j in range(K):
-            e = int(rt_cpu[t, j])
+            e = int(rt_cpu[t, j]) - expert_base
             if 0 <= e < num_experts:
                 counts[e][r] += 1
 
@@ -101,7 +109,7 @@ def reference_build_gather_layout(routing_topk: torch.Tensor,
         r = t // tokens_per_rank
         s = (r - local_rank + num_ranks) % num_ranks    # 表示当前rank下ring第s个位置
         for j in range(K):
-            e = int(rt_cpu[t, j])
+            e = int(rt_cpu[t, j]) - expert_base
             if not (0 <= e < num_experts):
                 continue
             off = cursor[e][s]  # 当前chunk写入了一些token，off记录下一个写入的位置
@@ -277,9 +285,12 @@ def test_gather_layout_generator():
         for expert_srank_padding in (True, False):
             for local_rank in range(num_ranks) if num_ranks <= 4 else [0, num_ranks - 1]:
                 torch.manual_seed(0xc0ffee ^ local_rank)
-                routing_topk = _generate_routing_topk(T, top_k, num_experts,
+                # routing_topk now holds GLOBAL expert ids drawn from the full pool
+                # of `num_experts * num_ranks` experts (num_experts = per-rank count).
+                routing_topk = _generate_routing_topk(T, top_k, num_experts * num_ranks,
                                                       seed=0xfade ^ local_rank)
-                topk_slot_offset = local_rank * top_k
+                # Global semantics: column j is already the global combine slot.
+                topk_slot_offset = 0
 
                 # GPU
                 gpu_gather, gpu_tile, gpu_glayout, gpu_m_t, gpu_psum, gpu_row_topk = \
@@ -328,10 +339,11 @@ def test_gather_layout_generator():
                 # ---- gather_index + row_to_topk (per-chunk pair multiset) ----
                 counts_cpu = [[0] * num_ranks for _ in range(num_experts)]
                 rt_cpu = routing_topk.cpu().numpy()
+                expert_base = local_rank * num_experts
                 for t in range(T):
                     r = t // tpr
                     for j in range(top_k):
-                        e = int(rt_cpu[t, j])
+                        e = int(rt_cpu[t, j]) - expert_base
                         if 0 <= e < num_experts:
                             counts_cpu[e][r] += 1
                 gpu_row_topk_used = gpu_row_topk[:gpu_m]
@@ -391,7 +403,9 @@ def test_gather_layout_with_gemm():
         for expert_srank_padding in (True, False):
             for local_rank in [0, num_ranks - 1]:
                 torch.manual_seed(0xfeed ^ local_rank)
-                routing_topk = _generate_routing_topk(T, top_k, num_experts,
+                # GLOBAL expert ids over the full pool; the layout maps them to this
+                # rank's local experts internally.
+                routing_topk = _generate_routing_topk(T, top_k, num_experts * num_ranks,
                                                       seed=0xbeef ^ local_rank)
 
                 # Build the layout

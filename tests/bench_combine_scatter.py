@@ -149,13 +149,22 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         a_global_bf16, MajorTypeAB.KMajor, quant_config.gran_k_a,
         quant_config.is_fp4_a, use_ue8m0=False)
 
-    _rank0_print(rank, 'Building gather layout...')
-    routing_topk = _generate_distinct_routing_topk(total_tokens, local_top_k, num_experts, seed=0xBEEF)
-    gather_index, _tile_rank, _grouped_layout, m_logical_t, psum_layout, row_to_topk = \
-        deep_gemm.build_gather_layout_for_rank_overlap(
-            routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m,
-            topk_slot_offset=rank * local_top_k)
-    m_logical = int(m_logical_t.item())
+    routing_topk = _generate_distinct_routing_topk(total_tokens, combine_top_k, args.global_num_experts, seed=0xBEEF)
+    use_compact_gemm2_layout = args.no_gather_a and not args.rank_padded_gemm2_layout
+    if use_compact_gemm2_layout:
+        _rank0_print(rank, f'Building compact GEMM2 layout ({args.compact_layout_order} order)...')
+        combine_src_index, psum_layout, row_to_topk, m_logical = _build_compact_gemm2_layout(
+            routing_topk, rank, num_ranks, tokens_per_rank, local_top_k, num_experts,
+            args.compact_layout_order)
+        gather_index = combine_src_index
+    else:
+        _rank0_print(rank, 'Building rank-padded gather layout...')
+        gather_index, _tile_rank, _grouped_layout, m_logical_t, psum_layout, row_to_topk = \
+            deep_gemm_moe_L2.build_gather_layout_for_rank_overlap(
+                routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m,
+                topk_slot_offset=0)
+        m_logical = int(m_logical_t.item())
+        combine_src_index = gather_index
     expected_m_per_expert = int((m_logical + num_experts - 1) // num_experts * 1.2)
     _rank0_print(rank, f'Gather layout ready: m_logical={m_logical}')
 

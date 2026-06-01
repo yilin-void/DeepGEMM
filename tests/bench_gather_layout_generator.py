@@ -105,8 +105,15 @@ def bench_one(num_ranks: int, tokens_per_rank: int, top_k: int,
     if local_ranks is None:
         local_ranks = [0]
 
+    # `num_experts` here is the GLOBAL expert count; the API takes the per-rank
+    # (local) count and maps global ids internally.
+    num_local_experts = num_experts // num_ranks
+    assert num_local_experts > 0, \
+        f'num_experts({num_experts}) must be >= num_ranks({num_ranks})'
+
     # One routing topk shared across local_ranks (Phase 1/3 only depend on the
-    # topk; Phase 2 outputs depend on `local_rank` but the *cost* barely changes).
+    # topk; Phase 2 outputs depend on `local_rank` but the *cost* doesn't).
+    # Values are GLOBAL expert ids drawn from the full pool of `num_experts`.
     torch.manual_seed(0xc0ffee)
     if routing_mode == 'random':
         routing_topk = _generate_random_routing_topk(T, top_k, num_experts, seed=0xfade)
@@ -120,18 +127,19 @@ def bench_one(num_ranks: int, tokens_per_rank: int, top_k: int,
     # doc). `T*K` is the exact upper bound on Σ n_real (sum of real-row chunk
     # sizes); each non-empty chunk contributes ≤ block_m-1 pad rows on top.
     total_pairs = T * top_k
-    num_chunks = num_experts * num_ranks if expert_srank_padding else num_experts
+    num_chunks = num_local_experts * num_ranks if expert_srank_padding else num_experts
     M_max = total_pairs + min(num_chunks, total_pairs) * (block_m - 1)
-    M_max_loose = num_experts * num_ranks * \
+    M_max_loose = num_local_experts * num_ranks * \
         (((tokens_per_rank + block_m - 1) // block_m) * block_m)
 
     print(f'  T = {T} ({num_ranks} × {tokens_per_rank}), '
           f'routing_mode = {routing_mode}')
     print(f'  expert_srank_padding = {expert_srank_padding}')
-    print(f'  local top_k = {top_k}, local num_experts = {num_experts}, block_m = {block_m}')
+    print(f'  top_k = {top_k}, global num_experts = {num_experts}, '
+          f'local_experts = {num_local_experts}, block_m = {block_m}')
     if routing_mode == 'all-ranks-local':
-        print(f'  global top_k = {num_ranks * top_k}, '
-              f'global num_experts = {num_ranks * num_experts}')
+        print(f'  (all-ranks-local) per-rank top_k = {top_k}, '
+              f'topk_slot_offset = local_rank * {top_k}')
     print(f'  M_max (tight, allocated) = {M_max:,} '
           f'({M_max * 4 / 1e6:.1f} MB per int32 tensor)')
     print(f'  M_max (loose, OLD bound) = {M_max_loose:,} '
@@ -146,9 +154,7 @@ def bench_one(num_ranks: int, tokens_per_rank: int, top_k: int,
         def fn():
             return deep_gemm.build_gather_layout_for_rank_overlap(
                 routing_topk, local_rank, num_ranks,
-                tokens_per_rank, num_experts, block_m,
-                topk_slot_offset=topk_slot_offset,
-                expert_srank_padding=expert_srank_padding)
+                tokens_per_rank, num_local_experts, block_m)
 
         # First build also reports the actual m_logical for context.
         out = fn()
@@ -220,7 +226,7 @@ def main(argv=None):
         return
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--tokens-per-rank', type=int, default=7351)
+    parser.add_argument('--tokens-per-rank', type=int, default=2*3488)
     parser.add_argument('--num-ranks', type=int, default=8)
     parser.add_argument('--top-k', type=int, default=16)
     parser.add_argument('--num-experts', type=int, default=512)
@@ -251,7 +257,10 @@ def main(argv=None):
         if args.global_num_experts is not None:
             if args.global_num_experts % args.num_ranks != 0:
                 raise ValueError('--global-num-experts must be divisible by --num-ranks')
-            bench_num_experts = args.global_num_experts // args.num_ranks
+            # `bench_one` treats num_experts as the GLOBAL count and divides by
+            # num_ranks internally, so pass the global value directly (do NOT
+            # pre-divide here, otherwise it gets divided twice).
+            bench_num_experts = args.global_num_experts
 
     print('Library path:')
     print(f' > {deep_gemm.__path__[0]}')

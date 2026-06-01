@@ -59,13 +59,14 @@ namespace deep_gemm {
 // -----------------------------------------------------------------------------
 template <uint32_t kNumThreads>
 __global__ void histogram_for_gather_layout(
-    const int* __restrict__ routing_topk,   // (T, K)
+    const int* __restrict__ routing_topk,   // (T, K), values are GLOBAL expert ids
     int* __restrict__ counts,               // (num_experts, num_ranks), zero-init by host
     uint32_t T,
     uint32_t K,
     uint32_t num_experts,
     uint32_t num_ranks,
-    uint32_t tokens_per_rank)
+    uint32_t tokens_per_rank,
+    uint32_t expert_base)                   // global id of this rank's first local expert
 {
     const uint32_t t = blockIdx.x * kNumThreads + threadIdx.x;
     if (t >= T) return;
@@ -74,11 +75,13 @@ __global__ void histogram_for_gather_layout(
 
     #pragma unroll 1
     for (uint32_t j = 0; j < K; ++j) {
-        const int e = __ldg(routing_topk + t * K + j);
-        // Defensive: silently drop out-of-range expert ids; host should never
-        // emit these, but a corrupted routing_map shouldn't OOB-write here.
-        if (static_cast<uint32_t>(e) < num_experts)
-            atomicAdd(&counts[static_cast<uint32_t>(e) * num_ranks + r], 1);
+        const int g = __ldg(routing_topk + t * K + j);   // global expert id
+        // Map global id -> this rank's local id and keep only experts owned by
+        // this rank. Negative ids (e.g. -1 "no expert") and experts on other
+        // ranks are silently dropped; this also guards against OOB writes.
+        const uint32_t e = static_cast<uint32_t>(g - static_cast<int>(expert_base));
+        if (g >= 0 && e < num_experts)
+            atomicAdd(&counts[e * num_ranks + r], 1);
     }
 }
 
@@ -405,7 +408,7 @@ __global__ void fill_layout_tables_for_gather_layout(
 // -----------------------------------------------------------------------------
 template <uint32_t kNumThreads>
 __global__ void scatter_for_gather_layout(
-    const int* __restrict__ routing_topk,    // (T, K)
+    const int* __restrict__ routing_topk,    // (T, K), values are GLOBAL expert ids
     const int* __restrict__ padded_starts,   // (num_experts, num_ranks) - [e][s]
     int* __restrict__ chunk_cursor,          // (num_experts, num_ranks), zero-init by host
     int* __restrict__ gather_index,          // (M_logical_max,) pre-init = -1
@@ -416,7 +419,8 @@ __global__ void scatter_for_gather_layout(
     uint32_t num_experts,
     uint32_t num_ranks,
     uint32_t tokens_per_rank,
-    uint32_t topk_slot_offset)
+    uint32_t topk_slot_offset,
+    uint32_t expert_base)                    // global id of this rank's first local expert
 {
     const uint32_t t = blockIdx.x * kNumThreads + threadIdx.x;
     if (t >= T) return;
@@ -426,10 +430,13 @@ __global__ void scatter_for_gather_layout(
 
     #pragma unroll 1
     for (uint32_t j = 0; j < K; ++j) {
-        const int e = __ldg(routing_topk + t * K + j);
-        if (static_cast<uint32_t>(e) >= num_experts)
-            continue;                                                // matches Phase 1's filter
-        const uint32_t chunk = static_cast<uint32_t>(e) * num_ranks + s;
+        const int g = __ldg(routing_topk + t * K + j);              // global expert id
+        // Same global->local map + filter as Phase 1 histogram (must stay in
+        // lockstep, otherwise counts and scatter positions disagree).
+        const uint32_t e = static_cast<uint32_t>(g - static_cast<int>(expert_base));
+        if (g < 0 || e >= num_experts)
+            continue;
+        const uint32_t chunk = e * num_ranks + s;
         const int off = atomicAdd(&chunk_cursor[chunk], 1);
         const int pos = padded_starts[chunk] + off;
         gather_index[pos] = static_cast<int>(t);
