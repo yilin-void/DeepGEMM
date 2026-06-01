@@ -467,12 +467,12 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         combine_scales = torch.empty((tokens_per_rank, combine_top_k, n_eff // 32),
                                      dtype=torch.float32, device='cuda')
     combine_handles = [None] * num_ranks
-    dist.all_gather_object(combine_handles, deep_gemm.cuda_ipc_get_mem_handle(combine_buffer), group=group)
-    combine_buffer_ptrs = deep_gemm.cuda_ipc_open_mem_handles(combine_handles, rank, combine_buffer)
+    dist.all_gather_object(combine_handles, deep_gemm_moe_L2.cuda_ipc_get_mem_handle(combine_buffer), group=group)
+    combine_buffer_ptrs = deep_gemm_moe_L2.cuda_ipc_open_mem_handles(combine_handles, rank, combine_buffer)
     if args.combine_scatter_fp8:
         combine_scale_handles = [None] * num_ranks
-        dist.all_gather_object(combine_scale_handles, deep_gemm.cuda_ipc_get_mem_handle(combine_scales), group=group)
-        combine_scale_ptrs = deep_gemm.cuda_ipc_open_mem_handles(combine_scale_handles, rank, combine_scales)
+        dist.all_gather_object(combine_scale_handles, deep_gemm_moe_L2.cuda_ipc_get_mem_handle(combine_scales), group=group)
+        combine_scale_ptrs = deep_gemm_moe_L2.cuda_ipc_open_mem_handles(combine_scale_handles, rank, combine_scales)
     if args.combine_scatter_local_buffer:
         _rank0_print(rank, 'Redirecting combine-scatter stores to a local mirror buffer...')
         local_scatter_buffer = torch.empty((num_ranks, tokens_per_rank, combine_top_k, n_eff),
@@ -516,7 +516,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                       combine_scatter_fp8=args.combine_scatter_fp8)
             if args.combine_scatter_fp8:
                 kw.update(combine_scale_ptrs=combine_scale_ptrs_t)
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+        deep_gemm_moe_L2.m_grouped_fp8_gemm_nt_contiguous(
             (a_pool, sfa_global), b_fp8, d, psum_layout,
             recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
             disable_ue8m0_cast=True,
@@ -596,7 +596,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     def run_local_reduce_only() -> None:
         with torch.cuda.stream(compute_stream):
             if args.combine_scatter_fp8:
-                deep_gemm.combine_reduce_slots_fp8(
+                deep_gemm_moe_L2.combine_reduce_slots_fp8(
                     combine_buffer, combine_scales, local_topk_scores, fused_reduce_output)
             else:
                 deep_gemm_moe_L2.combine_reduce_slots(combine_buffer, local_topk_scores, fused_reduce_output)
