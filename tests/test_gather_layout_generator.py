@@ -13,14 +13,11 @@ of the same layout. The two should agree on:
   - `m_logical` (scalar, exact)
   - `tile_rank[: num_m_tiles]` (exact)
   - `grouped_layout[: m_logical]` (exact)
-  - `gather_index[: m_logical]` (multiset per (expert, ring-step) chunk;
-    pad rows have value `-1`; the order of real-row tokens within a chunk
-    may differ between GPU and Python because Phase 3 uses `atomicAdd`).
-
-cd /home/guanrui03/cursor/moe/MoE_DeepGEMM_Combine/DeepGEMM
-PYTHONPATH=$PWD python tests/test_gather_layout_generator.py            # 跑全部 (unit + e2e)
-PYTHONPATH=$PWD python tests/test_gather_layout_generator.py -t unit    # 只跑 unit (layout 逐元素对齐参考)
-PYTHONPATH=$PWD python tests/test_gather_layout_generator.py -t e2e     # 只跑 e2e (generator → grouped GEMM)
+  - `psum_layout` (exact)
+  - `(gather_index, row_to_topk)[: m_logical]` (pair multiset per
+    (expert, ring-step) chunk; pad rows have value `-1`; the order of real rows
+    within a chunk may differ between GPU and Python because Phase 3 uses
+    `atomicAdd`).
 """
 
 import argparse
@@ -35,8 +32,8 @@ if os.path.exists(cache_dir):
 
 import torch
 
-import deep_gemm
-from deep_gemm.testing import get_arch_major
+import deep_gemm_moe_L2 as deep_gemm
+from deep_gemm_moe_L2.testing import get_arch_major
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +63,7 @@ def reference_build_gather_layout(routing_topk: torch.Tensor,
     # map + drop-others filter exactly (Phase 1 / Phase 3 stay in lockstep).
     expert_base = local_rank * num_experts
 
-    counts = [[0] * num_ranks for _ in range(num_experts)]  # 每个专家分别从各个rank接收token的个数，shape [num_experts, num_ranks]
+    counts = [[0] * num_ranks for _ in range(num_experts)]
     for t in range(T):
         r = t // tokens_per_rank
         for j in range(K):
@@ -74,8 +71,8 @@ def reference_build_gather_layout(routing_topk: torch.Tensor,
             if 0 <= e < num_experts:
                 counts[e][r] += 1
 
-    starts = [[0] * num_ranks for _ in range(num_experts)]  # 每个专家分别从各个rank接收token的开始位置，shape [num_experts, num_ranks]
-    tile_rank_list: list[int] = []  # len [num_tile]
+    starts = [[0] * num_ranks for _ in range(num_experts)]
+    tile_rank_list: list[int] = []
     cum = 0
     for e in range(num_experts):
         if expert_srank_padding:
@@ -103,16 +100,16 @@ def reference_build_gather_layout(routing_topk: torch.Tensor,
 
     gather = [-1] * m_logical
     row_to_topk = [-1] * m_logical
-    glayout = [0] * m_logical   # 表示每个token属于哪个专家
-    cursor = [[0] * num_ranks for _ in range(num_experts)]  # 每个专家分别从各个rank已经写了多少真实 row，shape [num_experts, num_ranks]
+    glayout = [0] * m_logical
+    cursor = [[0] * num_ranks for _ in range(num_experts)]
     for t in range(T):
         r = t // tokens_per_rank
-        s = (r - local_rank + num_ranks) % num_ranks    # 表示当前rank下ring第s个位置
+        s = (r - local_rank + num_ranks) % num_ranks
         for j in range(K):
             e = int(rt_cpu[t, j]) - expert_base
             if not (0 <= e < num_experts):
                 continue
-            off = cursor[e][s]  # 当前chunk写入了一些token，off记录下一个写入的位置
+            off = cursor[e][s]
             cursor[e][s] += 1
             pos = starts[e][s] + off
             gather[pos] = t
@@ -134,7 +131,7 @@ def reference_build_gather_layout(routing_topk: torch.Tensor,
             for i in range(next_base - base):
                 glayout[base + i] = e
 
-    psum_layout = []    # 表示专家在token维度上的结束边界
+    psum_layout = []
     for e in range(num_experts):
         psum_layout.append(starts[e + 1][0] if e + 1 < num_experts else m_logical)
 
@@ -285,12 +282,11 @@ def test_gather_layout_generator():
         for expert_srank_padding in (True, False):
             for local_rank in range(num_ranks) if num_ranks <= 4 else [0, num_ranks - 1]:
                 torch.manual_seed(0xc0ffee ^ local_rank)
-                # routing_topk now holds GLOBAL expert ids drawn from the full pool
-                # of `num_experts * num_ranks` experts (num_experts = per-rank count).
+                # routing_topk holds GLOBAL expert ids drawn from the full pool
+                # of `num_experts * num_ranks` experts (num_experts is per-rank).
                 routing_topk = _generate_routing_topk(T, top_k, num_experts * num_ranks,
                                                       seed=0xfade ^ local_rank)
-                # Global semantics: column j is already the global combine slot.
-                topk_slot_offset = 0
+                topk_slot_offset = local_rank * top_k
 
                 # GPU
                 gpu_gather, gpu_tile, gpu_glayout, gpu_m_t, gpu_psum, gpu_row_topk = \
@@ -403,8 +399,8 @@ def test_gather_layout_with_gemm():
         for expert_srank_padding in (True, False):
             for local_rank in [0, num_ranks - 1]:
                 torch.manual_seed(0xfeed ^ local_rank)
-                # GLOBAL expert ids over the full pool; the layout maps them to this
-                # rank's local experts internally.
+                # GLOBAL expert ids over the full pool; the layout maps them to
+                # this rank's local experts internally.
                 routing_topk = _generate_routing_topk(T, top_k, num_experts * num_ranks,
                                                       seed=0xbeef ^ local_rank)
 
@@ -469,7 +465,7 @@ def test_gather_layout_with_gemm():
                          f'ne={num_experts}, lr={local_rank}, '
                          f'expert_srank_padding={expert_srank_padding}')
 
-                from deep_gemm.testing import calc_diff
+                from deep_gemm_moe_L2.testing import calc_diff
                 diff = calc_diff(d.to(torch.bfloat16), ref_d)
                 max_diff = max(quant_config.max_diff(), 0.02)
                 assert diff < max_diff, \

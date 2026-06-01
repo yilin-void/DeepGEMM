@@ -556,7 +556,6 @@ tests/bench_combine_scatter.py
                               # 诊断用：把 peer destination 重定向到本地 HBM
 --fp8-debug-precision         # 配合 --check --combine-scatter-fp8 打印 FP8 误差来源诊断
 --scatter-rows-per-block      # standalone scatter-copy 的 rows/CTA，默认 4
---compact-layout-order        # compact GEMM2 row order：token 或 ring，默认 token
 ```
 
 该脚本只测 combine 相关路径，不把 all-gather 放进 timed path。每个 rank 用相同
@@ -597,17 +596,19 @@ route 后的 GEMM M。因为 `all-ranks-local` routing 会让每个 source token
 
 GEMM2 benchmark 默认使用 compact GEMM2 layout：按 local expert 聚合 row，不再按
 source rank 切 chunk，也不再使用 allgather-overlap 所需的 per-rank tile padding。
+该 layout 由 `build_gather_layout_for_rank_overlap(..., expert_srank_padding=False)` 生成，
+因此和 rank-padded overlap layout 共用同一套 global-expert routing 与 `row_to_topk`
+语义。
 当前 DeepGEMM contiguous psum layout 仍要求 expert 起点按 128 对齐，所以
-benchmark 输出里的 `m_logical` 会从真实 row 数 `111616` 增加到 `115456`。旧的
-rank-padded overlap layout 会得到 `m_logical=131328`，可用
-`--rank-padded-gemm2-layout` 复现。
+benchmark 输出里的 `m_logical` 会从真实 row 数 `111616` 增加到每 rank 约 `115k`。
+以当前 exact all-ranks-local routing seed 为例，compact layout 的各 rank 范围是
+`115072..115584`，rank 0 为 `115584`。旧的 rank-padded overlap layout 会得到
+`131200..131456`，可用 `--rank-padded-gemm2-layout` 复现。
 
-compact GEMM2 layout 的 row order 可以通过 `--compact-layout-order` 控制：
-
-- `token`：默认模式。每个 expert 内按 global source token 顺序排列 row。
-- `ring`：每个 expert 内按当前 rank 起点的 source-rank ring order 排列 row，即
-  `rank, rank + 1, ...`。该模式用于检查目的 rank 写入热点是否会明显影响
-  combine-scatter epilogue。
+compact GEMM2 layout 在每个 expert 内保留当前 rank 起点的 source-rank ring order，
+但只在 expert 边界做一次 padding。这样可以避免 rank-padded overlap layout 的
+per-source-rank padding，同时仍保留 `gather_index`、`psum_layout`、`row_to_topk` 的统一
+生成路径。
 
 对应到 benchmark 参数：
 
@@ -682,10 +683,10 @@ tokens/rank = 6976
 hidden = 1280
 global_top_k = 16
 local_top_k = 2
-m_logical = 115456
+m_logical ~= 115k  # rank-dependent; rank 0 is 115584 with current exact all-ranks-local seed
 n = 2048
 gather_a = false
-layout = compact-gemm2/token
+layout = compact-gemm2/expert-only-ring
 ```
 
 结果按方案拆分如下。表里 `total` 是直接测整条路径的 median，不是把各组件 median
@@ -928,14 +929,19 @@ pack 或本地 store 指令本身。
 ### 6.7 compact layout row-order 实验
 
 为了确认 fused scatter 的额外开销是否来自 source-rank row order 导致的 peer-store
-热点，benchmark 增加了 `--compact-layout-order {token,ring}`。
+热点，曾经在 Python benchmark 里临时实现过 token-order 与 ring-order 两种 compact
+layout。这个实验已经收敛：当前代码不再保留单独的 Python layout builder，也没有
+`--compact-layout-order` 参数；compact GEMM2 layout 统一由
+`build_gather_layout_for_rank_overlap(..., expert_srank_padding=False)` 生成。
 
-其中 `ring` 模式只改变每个 expert 内真实 row 的排列顺序，不改变数学语义：
+当前固定采用 expert-only ring order。它只改变每个 expert 内真实 row 的排列顺序，
+不改变数学语义：
 
 - `combine_src_index` 仍然指向同一个 source token 集合。
 - `row_to_topk` 仍然指向对应 rank 的 top-k slot。
-- `psum_layout` 仍使用真实 row 结束边界，避免重新引入 expert padding work。
-- `m_logical` 仍为 `115456`，padding rows 仍为 `3840`。
+- `psum_layout` 仍使用真实 row 结束边界，避免重新引入 per-source-rank padding work。
+- 当前 exact all-ranks-local routing seed 下，rank 0 的 `m_logical=115584`，
+  padding rows 为 `3968`；各 rank 会因 expert 负载随机性略有差异。
 
 correctness smoke：
 
@@ -951,7 +957,7 @@ tokens       = 32
 mismatches   = 0
 ```
 
-core-only 对比命令只保留 fused path 和 local reduction，使用 `warmups=10`、
+当前 core-only 复现命令只保留 fused path 和 local reduction，使用 `warmups=10`、
 `iters=50`：
 
 ```bash
@@ -964,14 +970,11 @@ python3 tests/bench_combine_scatter.py \
   --global-num-experts 512 \
   --experts-per-rank-token 2 \
   --no-gather-a \
-  --compact-layout-order token \
   --warmups 10 \
   --iters 50
 ```
 
-把 `--compact-layout-order token` 改成 `ring` 即可复现 ring-order 对比。
-
-结果：
+历史 row-order 对比结果：
 
 | compact layout order | GEMM no scatter | fused GEMM + scatter | local reduction | total fused + local reduction |
 | --- | ---: | ---: | ---: | ---: |
@@ -989,8 +992,9 @@ python3 tests/bench_combine_scatter.py \
 
 - ring-order 对 fused GEMM + scatter 的 event time 只改善约 `4.26 us`，约 `0.27%`。
 - standalone scatter-copy 有约 `0.7%` 的 event time 改善，但幅度仍然很小。
-- 这说明当前主要瓶颈不是简单的 source-rank row order 热点。后续优化应继续聚焦
-  combine-scatter epilogue 的 remote store 路径和 accumulator 写回结构。
+- 这说明当前主要瓶颈不是简单的 source-rank row order 热点。因此当前代码保留
+  gather-layout API 生成的 expert-only ring order，后续优化继续聚焦 combine-scatter
+  epilogue 的 remote store 路径和 accumulator 写回结构。
 
 ### 6.8 direct-store 重排实验结论
 
@@ -1116,9 +1120,9 @@ slot 写入和 local reduction 没有明显实现错误，主要误差来自 FP8
 
 2. **继续优化 remote store 路径，而不是优先调整 compact row order**
 
-   `--compact-layout-order ring` 只带来噪声级改善，说明 source-rank row order 不是当前
-   fused scatter 的主瓶颈。后续应继续关注 peer-store 指令形态、store 粒度、写入合并
-   以及 epilogue 内等待和同步成本。
+   token-order 与 ring-order 的历史对比只带来噪声级差异，说明 source-rank row order
+   不是当前 fused scatter 的主瓶颈。后续应继续关注 peer-store 指令形态、store 粒度、
+   写入合并以及 epilogue 内等待和同步成本。
 
 3. **确定 FP8 correctness gate**
 

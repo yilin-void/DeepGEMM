@@ -24,9 +24,9 @@ sys.path.insert(0, REPO_ROOT)
 import torch
 import torch.distributed as dist
 
-import deep_gemm
-from deep_gemm.testing import get_arch_major
-from deep_gemm.utils.dist import dist_print, init_dist
+import deep_gemm_moe_L2
+from deep_gemm_moe_L2.testing import get_arch_major
+from deep_gemm_moe_L2.utils.dist import dist_print, init_dist
 
 sys.path.insert(0, os.path.dirname(__file__))
 from generators import (  # noqa: E402
@@ -37,19 +37,25 @@ from generators import (  # noqa: E402
 )
 
 
-def _generate_distinct_routing_topk(num_tokens: int, top_k: int, num_experts: int, seed: int) -> torch.Tensor:
-    if top_k > num_experts:
-        raise ValueError(f'top_k ({top_k}) must be <= num_experts ({num_experts})')
+def _generate_all_ranks_local_routing_topk(num_tokens: int,
+                                           local_top_k: int,
+                                           global_num_experts: int,
+                                           num_ranks: int,
+                                           seed: int) -> torch.Tensor:
+    if global_num_experts % num_ranks != 0:
+        raise ValueError('global_num_experts must be divisible by num_ranks')
+    local_num_experts = global_num_experts // num_ranks
+    if local_top_k > local_num_experts:
+        raise ValueError(f'local_top_k ({local_top_k}) must be <= local experts ({local_num_experts})')
 
     gen = torch.Generator(device='cuda')
     gen.manual_seed(seed)
-    scores = torch.rand((num_tokens, num_experts), dtype=torch.float32,
+    scores = torch.rand((num_tokens, num_ranks, local_num_experts), dtype=torch.float32,
                         device='cuda', generator=gen)
-    return torch.topk(scores, top_k, dim=1).indices.to(torch.int32)
-
-
-def _align(value: int, alignment: int) -> int:
-    return ((value + alignment - 1) // alignment) * alignment
+    local_choices = torch.topk(scores, local_top_k, dim=2).indices
+    expert_offsets = torch.arange(num_ranks, device='cuda', dtype=torch.int64) * local_num_experts
+    routing_topk = local_choices + expert_offsets.view(1, num_ranks, 1)
+    return routing_topk.reshape(num_tokens, num_ranks * local_top_k).to(torch.int32)
 
 
 def _make_wgmma_n32_physical_to_logical_index(n: int, device: torch.device) -> torch.Tensor:
@@ -76,63 +82,6 @@ def _make_wgmma_n64_physical_to_logical_index(n: int, device: torch.device) -> t
     in_tile_logical = lane_group * 16 + half * 8 + pair * 2 + elem
     tile_base = torch.arange(0, n, 64, device=device).unsqueeze(1)
     return (tile_base + in_tile_logical.unsqueeze(0)).reshape(-1).to(torch.long)
-
-
-def _build_compact_gemm2_layout(routing_topk: torch.Tensor,
-                                rank: int,
-                                num_ranks: int,
-                                tokens_per_rank: int,
-                                local_top_k: int,
-                                num_experts: int,
-                                layout_order: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
-    cursor = 0
-    psum_values: list[int] = []
-    row_chunks: list[tuple[int, torch.Tensor, torch.Tensor]] = []
-
-    for expert in range(num_experts):
-        cursor = _align(cursor, alignment)
-        if layout_order == 'token':
-            positions = (routing_topk == expert).nonzero(as_tuple=False)
-            src_tokens = positions[:, 0].to(torch.int32).contiguous()
-            topk_slots = (positions[:, 1].to(torch.int32) + rank * local_top_k).contiguous()
-        elif layout_order == 'ring':
-            src_chunks = []
-            topk_chunks = []
-            for step in range(num_ranks):
-                src_rank = (rank + step) % num_ranks
-                token_start = src_rank * tokens_per_rank
-                token_end = token_start + tokens_per_rank
-                positions = (routing_topk[token_start:token_end] == expert).nonzero(as_tuple=False)
-                if positions.numel() == 0:
-                    continue
-                src_chunks.append((positions[:, 0].to(torch.int32) + token_start).contiguous())
-                topk_chunks.append((positions[:, 1].to(torch.int32) + rank * local_top_k).contiguous())
-            if src_chunks:
-                src_tokens = torch.cat(src_chunks)
-                topk_slots = torch.cat(topk_chunks)
-            else:
-                src_tokens = torch.empty((0,), dtype=torch.int32, device=routing_topk.device)
-                topk_slots = torch.empty((0,), dtype=torch.int32, device=routing_topk.device)
-        else:
-            raise ValueError(f'unknown compact layout order: {layout_order}')
-        row_chunks.append((cursor, src_tokens, topk_slots))
-        cursor += int(src_tokens.numel())
-        psum_values.append(cursor)
-
-    m_logical = _align(cursor, alignment)
-    combine_src_index = torch.full((m_logical,), -1, dtype=torch.int32, device='cuda')
-    row_to_topk = torch.full((m_logical,), -1, dtype=torch.int32, device='cuda')
-    for start, src_tokens, topk_slots in row_chunks:
-        end = start + int(src_tokens.numel())
-        if end == start:
-            continue
-        combine_src_index[start:end] = src_tokens
-        row_to_topk[start:end] = topk_slots
-
-    psum_layout = torch.tensor(psum_values, dtype=torch.int32, device='cuda')
-    return combine_src_index, psum_layout, row_to_topk, m_logical
-
 
 def _rank0_print(rank: int, msg: str) -> None:
     if rank == 0:
@@ -354,9 +303,9 @@ def _check_against_reference(label: str,
 
 def _init_nccl_cpp_comm(rank: int, num_ranks: int, local_rank: int,
                         group: dist.ProcessGroup):
-    nccl_unique_ids = [deep_gemm.nccl_get_unique_id() if rank == 0 else None]
+    nccl_unique_ids = [deep_gemm_moe_L2.nccl_get_unique_id() if rank == 0 else None]
     dist.broadcast_object_list(nccl_unique_ids, src=0, group=group)
-    comm = deep_gemm.nccl_comm_init_rank(nccl_unique_ids[0], rank, num_ranks, local_rank)
+    comm = deep_gemm_moe_L2.nccl_comm_init_rank(nccl_unique_ids[0], rank, num_ranks, local_rank)
     dist.barrier(group=group)
     return comm
 
@@ -388,24 +337,24 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     torch.manual_seed(0x2026)
     a_global_bf16 = torch.randn((total_tokens, hidden), dtype=torch.bfloat16, device='cuda')
 
-    routing_topk = _generate_distinct_routing_topk(total_tokens, combine_top_k, args.global_num_experts, seed=0xBEEF)
+    routing_topk = _generate_all_ranks_local_routing_topk(
+        total_tokens, local_top_k, args.global_num_experts, num_ranks, seed=0xBEEF)
     use_compact_gemm2_layout = args.no_gather_a and not args.rank_padded_gemm2_layout
+    expert_srank_padding = not use_compact_gemm2_layout
     if use_compact_gemm2_layout:
-        _rank0_print(rank, f'Building compact GEMM2 layout ({args.compact_layout_order} order)...')
-        combine_src_index, psum_layout, row_to_topk, m_logical = _build_compact_gemm2_layout(
-            routing_topk, rank, num_ranks, tokens_per_rank, local_top_k, num_experts,
-            args.compact_layout_order)
-        gather_index = combine_src_index
+        _rank0_print(rank, 'Building compact GEMM2 layout via gather-layout API...')
     else:
         _rank0_print(rank, 'Building rank-padded gather layout...')
-        gather_index, _tile_rank, _grouped_layout, m_logical_t, psum_layout, row_to_topk = \
-            deep_gemm.build_gather_layout_for_rank_overlap(
-                routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m,
-                topk_slot_offset=0)
-        m_logical = int(m_logical_t.item())
-        combine_src_index = gather_index
+
+    gather_index, _tile_rank, _grouped_layout, m_logical_t, psum_layout, row_to_topk = \
+        deep_gemm_moe_L2.build_gather_layout_for_rank_overlap(
+            routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m,
+            topk_slot_offset=0,
+            expert_srank_padding=expert_srank_padding)
+    m_logical = int(m_logical_t.item())
+    combine_src_index = gather_index
     expected_m_per_expert = int((m_logical + num_experts - 1) // num_experts * 1.2)
-    real_rows = total_tokens * local_top_k
+    real_rows = int((combine_src_index[:m_logical] >= 0).sum().item())
     _rank0_print(rank, f'GEMM layout ready: m_logical={m_logical}, padding_rows={m_logical - real_rows}')
 
     if args.no_gather_a:
@@ -448,8 +397,8 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     if args.bench_peer_tma_store or args.bench_peer_stg_store:
         peer_tma_d_local = torch.empty_like(d)
         peer_tma_handles = [None] * num_ranks
-        dist.all_gather_object(peer_tma_handles, deep_gemm.cuda_ipc_get_mem_handle(peer_tma_d_local), group=group)
-        peer_tma_ptrs = deep_gemm.cuda_ipc_open_mem_handles(peer_tma_handles, rank, peer_tma_d_local)
+        dist.all_gather_object(peer_tma_handles, deep_gemm_moe_L2.cuda_ipc_get_mem_handle(peer_tma_d_local), group=group)
+        peer_tma_ptrs = deep_gemm_moe_L2.cuda_ipc_open_mem_handles(peer_tma_handles, rank, peer_tma_d_local)
         peer_tma_dst_rank = (rank + 1) % num_ranks
         peer_tma_ptr_override = int(peer_tma_ptrs[peer_tma_dst_rank])
 
@@ -554,7 +503,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
 
     def run_standalone_scatter() -> None:
         with torch.cuda.stream(compute_stream):
-            deep_gemm.combine_scatter_copy_rows(
+            deep_gemm_moe_L2.combine_scatter_copy_rows(
                 d, combine_src_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, args.scatter_rows_per_block)
         torch.cuda.current_stream().wait_stream(compute_stream)
@@ -562,7 +511,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     def run_two_stage_scatter() -> None:
         with torch.cuda.stream(compute_stream):
             launch_gemm(enable_combine_scatter=False)
-            deep_gemm.combine_scatter_copy_rows(
+            deep_gemm_moe_L2.combine_scatter_copy_rows(
                 d, combine_src_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, args.scatter_rows_per_block)
         torch.cuda.current_stream().wait_stream(compute_stream)
@@ -570,26 +519,26 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     def run_pack_for_reduce_scatter() -> None:
         with torch.cuda.stream(compute_stream):
             reduce_scatter_input.zero_()
-            deep_gemm.combine_pack_for_reduce_scatter(
+            deep_gemm_moe_L2.combine_pack_for_reduce_scatter(
                 d, combine_src_index, row_to_topk, combine_topk_scores, reduce_scatter_input,
                 tokens_per_rank, combine_top_k)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
     def run_nccl_reduce_scatter() -> None:
         with torch.cuda.stream(comm_stream):
-            deep_gemm.nccl_reduce_scatter_sum(reduce_scatter_input, reduce_scatter_output, nccl_cpp_comm)
+            deep_gemm_moe_L2.nccl_reduce_scatter_sum(reduce_scatter_input, reduce_scatter_output, nccl_cpp_comm)
         torch.cuda.current_stream().wait_stream(comm_stream)
 
     def run_reduce_scatter_baseline() -> None:
         with torch.cuda.stream(compute_stream):
             launch_gemm(enable_combine_scatter=False)
             reduce_scatter_input.zero_()
-            deep_gemm.combine_pack_for_reduce_scatter(
+            deep_gemm_moe_L2.combine_pack_for_reduce_scatter(
                 d, combine_src_index, row_to_topk, combine_topk_scores, reduce_scatter_input,
                 tokens_per_rank, combine_top_k)
         with torch.cuda.stream(comm_stream):
             comm_stream.wait_stream(compute_stream)
-            deep_gemm.nccl_reduce_scatter_sum(reduce_scatter_input, reduce_scatter_output, nccl_cpp_comm)
+            deep_gemm_moe_L2.nccl_reduce_scatter_sum(reduce_scatter_input, reduce_scatter_output, nccl_cpp_comm)
         torch.cuda.current_stream().wait_stream(compute_stream)
         torch.cuda.current_stream().wait_stream(comm_stream)
 
@@ -599,7 +548,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                 deep_gemm_moe_L2.combine_reduce_slots_fp8(
                     combine_buffer, combine_scales, local_topk_scores, fused_reduce_output)
             else:
-                deep_gemm.combine_reduce_slots(combine_buffer, local_topk_scores, fused_reduce_output)
+                deep_gemm_moe_L2.combine_reduce_slots(combine_buffer, local_topk_scores, fused_reduce_output)
         torch.cuda.current_stream().wait_stream(compute_stream)
 
     def run_fused_scatter_then_local_reduce() -> None:
@@ -632,7 +581,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             if n_physical_to_logical is not None:
                 d_for_check = torch.empty_like(d)
                 d_for_check[:, n_physical_to_logical] = d
-            max_diff_t, mismatch_count_t = deep_gemm.check_combine_scatter_output(
+            max_diff_t, mismatch_count_t = deep_gemm_moe_L2.check_combine_scatter_output(
                 d_for_check, combine_src_index, row_to_topk, combine_buffer_ptrs_t,
                 tokens_per_rank, combine_top_k, 0.0)
             torch.cuda.synchronize()
@@ -873,7 +822,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         print(f'  global_experts={args.global_num_experts}, local_experts={num_experts}, '
               f'global_top_k={combine_top_k}, local_top_k={local_top_k}', flush=True)
         print(f'  m_logical={m_logical}, n={args.n}, num_weights={args.num_weights}, n_eff={n_eff}', flush=True)
-        layout_name = f'compact-gemm2/{args.compact_layout_order}' if use_compact_gemm2_layout else 'rank-padded'
+        layout_name = 'compact-gemm2/expert-only-ring' if use_compact_gemm2_layout else 'rank-padded'
         print(f'  gather_a={not args.no_gather_a}, layout={layout_name}, '
               f'direct_accum_stg={args.combine_scatter_direct_accum_stg}, '
               f'fp8_scatter={args.combine_scatter_fp8}', flush=True)
@@ -944,9 +893,6 @@ def main() -> None:
     parser.add_argument('--rank-padded-gemm2-layout', action='store_true',
                         help='With --no-gather-a, keep the old rank-padded overlap layout instead of compact '
                              'expert-only GEMM2 layout')
-    parser.add_argument('--compact-layout-order', choices=('token', 'ring'), default='token',
-                        help='Row order for compact GEMM2 layout. token keeps global-token order; ring visits '
-                             'source ranks in local ring order inside each expert.')
     parser.add_argument('--bench-standalone-scatter', action='store_true',
                         help='Benchmark separate D -> peer combine-buffer scatter-copy and two-stage total')
     parser.add_argument('--bench-peer-tma-store', action='store_true',

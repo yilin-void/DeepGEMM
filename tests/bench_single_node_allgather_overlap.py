@@ -24,9 +24,9 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
-import deep_gemm
-from deep_gemm.testing import get_arch_major
-from deep_gemm.utils.dist import dist_print, init_dist
+import deep_gemm_moe_L2 as deep_gemm
+from deep_gemm_moe_L2.testing import get_arch_major
+from deep_gemm_moe_L2.utils.dist import dist_print, init_dist
 
 sys.path.insert(0, os.path.dirname(__file__))
 from generators import (  # noqa: E402
@@ -53,6 +53,27 @@ def _generate_distinct_routing_topk(num_tokens: int, top_k: int, num_experts: in
     scores = torch.rand((num_tokens, num_experts), dtype=torch.float32,
                         device='cuda', generator=gen)
     return torch.topk(scores, top_k, dim=1).indices.to(torch.int32)
+
+
+def _generate_all_ranks_local_routing_topk(num_tokens: int,
+                                           local_top_k: int,
+                                           global_num_experts: int,
+                                           num_ranks: int,
+                                           seed: int) -> torch.Tensor:
+    if global_num_experts % num_ranks != 0:
+        raise ValueError('global_num_experts must be divisible by num_ranks')
+    local_num_experts = global_num_experts // num_ranks
+    if local_top_k > local_num_experts:
+        raise ValueError(f'local_top_k ({local_top_k}) must be <= local experts ({local_num_experts})')
+
+    gen = torch.Generator(device='cuda')
+    gen.manual_seed(seed)
+    scores = torch.rand((num_tokens, num_ranks, local_num_experts), dtype=torch.float32,
+                        device='cuda', generator=gen)
+    local_choices = torch.topk(scores, local_top_k, dim=2).indices
+    expert_offsets = torch.arange(num_ranks, device='cuda', dtype=torch.int64) * local_num_experts
+    routing_topk = local_choices + expert_offsets.view(1, num_ranks, 1)
+    return routing_topk.reshape(num_tokens, num_ranks * local_top_k).to(torch.int32)
 
 
 def _should_profile_rank(arg: str, rank: int, num_ranks: int, cross_rank_sync: str) -> bool:
@@ -146,6 +167,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     hidden = args.hidden
     num_experts = args.num_experts
     top_k = args.top_k
+    local_top_k = None
     block_m = args.block_m
     routing_desc = 'random'
 
@@ -158,10 +180,14 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             raise ValueError('--top-k must equal --experts-per-rank-token * EP/world size')
 
         num_experts = args.global_num_experts // num_ranks
-        top_k = args.experts_per_rank_token
+        local_top_k = args.experts_per_rank_token
         routing_desc = (f'all-ranks-local: global_experts={args.global_num_experts}, '
                         f'global_top_k={args.top_k}, local_experts={num_experts}, '
-                        f'local_top_k={top_k}')
+                        f'local_top_k={local_top_k}')
+
+    if not args.expert_srank_padding and args.allgather_backend == 'symm':
+        raise ValueError('--no-expert-srank-padding may mix source ranks inside one M tile, '
+                         'so it is only supported with the no-rank-flags NCCL C++ backend in this benchmark')
 
     _rank0_print(rank, 'Preparing benchmark tensors...')
     quant_config = QuantConfig()
@@ -195,11 +221,11 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     # Grouped GEMM metadata and weights.
     _rank0_print(rank, 'Building gather layout...')
     if args.routing_mode == 'all-ranks-local':
-        routing_topk = _generate_distinct_routing_topk(total_tokens, top_k, num_experts, seed=0xBEEF)
-        topk_slot_offset = rank * top_k
+        routing_topk = _generate_all_ranks_local_routing_topk(
+            total_tokens, local_top_k, args.global_num_experts, num_ranks, seed=0xBEEF)
     else:
-        routing_topk = _generate_routing_topk(total_tokens, top_k, num_experts, seed=0xBEEF)
-        topk_slot_offset = 0
+        routing_topk = _generate_routing_topk(total_tokens, top_k, num_experts * num_ranks, seed=0xBEEF)
+    topk_slot_offset = 0
     gather_index, tile_rank, grouped_layout, m_logical_t, psum_layout, _row_to_topk = \
         deep_gemm.build_gather_layout_for_rank_overlap(
             routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m,
@@ -585,7 +611,7 @@ def main() -> None:
     parser.add_argument('--top-k', type=int, default=2)
     parser.add_argument('--routing-mode', type=str, default='random',
                         choices=('random', 'all-ranks-local'),
-                        help='random: top-k local experts; all-ranks-local: global top-k split evenly across EP ranks')
+                        help='random: global random top-k; all-ranks-local: global top-k split evenly across EP ranks')
     parser.add_argument('--global-num-experts', type=int, default=None,
                         help='Global expert count for all-ranks-local routing')
     parser.add_argument('--experts-per-rank-token', type=int, default=2,
