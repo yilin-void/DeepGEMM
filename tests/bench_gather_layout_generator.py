@@ -1,20 +1,23 @@
 """
-Bench `deep_gemm.build_gather_layout_for_rank_overlap` (Phase 1+2+3 generator).
+Bench `deep_gemm.build_gather_layout_for_rank_overlap` layout generator.
 
 Measures both:
-  - per-kernel GPU time via `bench_kineto` (3 separate kernels in the trace)
+  - per-kernel GPU time via `bench_kineto` (4 separate kernels in the trace)
   - end-to-end wall time via `bench()` (includes alloc + JIT-cache lookup
-    + 3 kernel launches; what the caller actually pays per build).
+    + 4 kernel launches; what the caller actually pays per build).
 
 Default config matches the user's request:
-    tokens_per_rank = 7351,  num_ranks = 8,  top_k = 16,
-    num_experts     = 512,   block_m   = 128.
+    random mode: tokens_per_rank = 7351, num_ranks = 8, top_k = 16,
+                 num_experts = 512, block_m = 128.
 
 Run:
     python tests/bench_gather_layout_generator.py
 
-cd /home/guanrui03/cursor/moe/MoE_DeepGEMM_Combine/DeepGEMM
-PYTHONPATH=$PWD python tests/bench_gather_layout_generator.py
+Example matching the overlap benchmark's routing shape:
+    python tests/bench_gather_layout_generator.py \
+      --routing-mode all-ranks-local \
+      --global-num-experts 512 \
+      --experts-per-rank-token 2
 """
 
 import argparse
@@ -27,26 +30,52 @@ import torch
 # `csrc/jit_kernels/impls/moe_gather_layout.hpp`; mixing host code (old) with
 # device headers (new) would manifest as a JIT NVCC error like
 # `identifier "prefix_and_fill_for_gather_layout" is undefined`.
-import deep_gemm
-from deep_gemm.testing import bench, bench_kineto, get_arch_major
-from deep_gemm.testing.bench import suppress_stdout_stderr
+import deep_gemm_moe_L2 as deep_gemm
+from deep_gemm_moe_L2.testing import bench, bench_kineto, get_arch_major
+from deep_gemm_moe_L2.testing.bench import suppress_stdout_stderr
 
 
 # ---------------------------------------------------------------------------
 # Routing-topk generator
 # ---------------------------------------------------------------------------
-def _generate_routing_topk(num_total_tokens: int, top_k: int,
-                           num_experts: int, *, seed: int = 0) -> torch.Tensor:
-    """Random distinct top-k per row.
+def _generate_random_routing_topk(num_total_tokens: int, top_k: int,
+                                  num_experts: int, *, seed: int = 0) -> torch.Tensor:
+    """Random top-k expert choices; duplicates are allowed, matching overlap bench random mode."""
+    g = torch.Generator(device='cuda').manual_seed(seed)
+    return torch.randint(0, num_experts, (num_total_tokens, top_k),
+                         dtype=torch.int32, device='cuda', generator=g)
 
-    Uses a single ``argsort`` over a random matrix instead of looping
-    ``randperm`` per row, so generating ~60k rows × 16 entries doesn't take
-    minutes.
-    """
+
+def _generate_distinct_routing_topk(num_total_tokens: int, top_k: int,
+                                    num_experts: int, *, seed: int = 0) -> torch.Tensor:
+    """Score-sorted distinct global top-k per row."""
+    if top_k > num_experts:
+        raise ValueError(f'top_k ({top_k}) must be <= num_experts ({num_experts})')
     g = torch.Generator(device='cuda').manual_seed(seed)
     scores = torch.rand((num_total_tokens, num_experts),
                         generator=g, device='cuda')
-    return scores.argsort(dim=1)[:, :top_k].contiguous().to(torch.int32)
+    return torch.topk(scores, top_k, dim=1).indices.contiguous().to(torch.int32)
+
+
+def _generate_all_ranks_local_routing_topk(num_total_tokens: int,
+                                           local_top_k: int,
+                                           global_num_experts: int,
+                                           num_ranks: int,
+                                           *,
+                                           seed: int = 0) -> torch.Tensor:
+    """Pick local_top_k global experts from every rank's expert shard."""
+    if global_num_experts % num_ranks != 0:
+        raise ValueError('global_num_experts must be divisible by num_ranks')
+    local_num_experts = global_num_experts // num_ranks
+    if local_top_k > local_num_experts:
+        raise ValueError(f'local_top_k ({local_top_k}) must be <= local experts ({local_num_experts})')
+    g = torch.Generator(device='cuda').manual_seed(seed)
+    scores = torch.rand((num_total_tokens, num_ranks, local_num_experts),
+                        generator=g, device='cuda')
+    local_choices = torch.topk(scores, local_top_k, dim=2).indices
+    expert_offsets = torch.arange(num_ranks, device='cuda', dtype=torch.int64) * local_num_experts
+    routing_topk = local_choices + expert_offsets.view(1, num_ranks, 1)
+    return routing_topk.reshape(num_total_tokens, num_ranks * local_top_k).to(torch.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +114,8 @@ def _silent_warmup(fn, n: int = 2):
 # ---------------------------------------------------------------------------
 def bench_one(num_ranks: int, tokens_per_rank: int, top_k: int,
               num_experts: int, block_m: int,
+              routing_mode: str = 'random',
+              expert_srank_padding: bool = True,
               num_kineto_tests: int = 30,
               local_ranks=None):
     T = num_ranks * tokens_per_rank
@@ -98,23 +129,32 @@ def bench_one(num_ranks: int, tokens_per_rank: int, top_k: int,
         f'num_experts({num_experts}) must be >= num_ranks({num_ranks})'
 
     # One routing topk shared across local_ranks (Phase 1/3 only depend on the
-    # topk; Phase 2 outputs depend on `local_rank` but the *cost* doesn't).
+    # topk; Phase 2 outputs depend on `local_rank` but the cost barely changes).
     # Values are GLOBAL expert ids drawn from the full pool of `num_experts`.
     torch.manual_seed(0xc0ffee)
-    routing_topk = _generate_routing_topk(T, top_k, num_experts, seed=0xfade)
+    if routing_mode == 'random':
+        routing_topk = _generate_random_routing_topk(T, top_k, num_experts, seed=0xfade)
+    elif routing_mode == 'all-ranks-local':
+        if top_k % num_ranks != 0:
+            raise ValueError('all-ranks-local top_k must be divisible by num_ranks')
+        routing_topk = _generate_all_ranks_local_routing_topk(
+            T, top_k // num_ranks, num_experts, num_ranks, seed=0xfade)
+    else:
+        raise ValueError(f'unknown routing_mode: {routing_mode}')
 
     # Tight analytical M_max used by the generator (see
     # `csrc/jit_kernels/impls/moe_gather_layout.hpp` and §11.4.4 in the design
     # doc). `T*K` is the exact upper bound on Σ n_real (sum of real-row chunk
     # sizes); each non-empty chunk contributes ≤ block_m-1 pad rows on top.
     total_pairs = T * top_k
-    num_chunks = num_local_experts * num_ranks
+    num_chunks = num_local_experts * num_ranks if expert_srank_padding else num_local_experts
     M_max = total_pairs + min(num_chunks, total_pairs) * (block_m - 1)
     M_max_loose = num_local_experts * num_ranks * \
         (((tokens_per_rank + block_m - 1) // block_m) * block_m)
 
-    print(f'  T = {T} ({num_ranks} × {tokens_per_rank}), '
-          f'top_k = {top_k}, num_experts(global) = {num_experts}, '
+    print(f'  T = {T} ({num_ranks} × {tokens_per_rank}), routing_mode = {routing_mode}')
+    print(f'  expert_srank_padding = {expert_srank_padding}')
+    print(f'  top_k = {top_k}, num_experts(global) = {num_experts}, '
           f'local_experts = {num_local_experts}, block_m = {block_m}')
     print(f'  M_max (tight, allocated) = {M_max:,} '
           f'({M_max * 4 / 1e6:.1f} MB per int32 tensor)')
@@ -125,16 +165,25 @@ def bench_one(num_ranks: int, tokens_per_rank: int, top_k: int,
     rows_kineto = []
     rows_e2e    = []
     for local_rank in local_ranks:
+        topk_slot_offset = 0
+
         def fn():
             return deep_gemm.build_gather_layout_for_rank_overlap(
                 routing_topk, local_rank, num_ranks,
-                tokens_per_rank, num_local_experts, block_m)
+                tokens_per_rank, num_local_experts, block_m,
+                topk_slot_offset=topk_slot_offset,
+                expert_srank_padding=expert_srank_padding)
 
         # First build also reports the actual m_logical for context.
         out = fn()
         torch.cuda.synchronize()
         m_logical = int(out[3].item())
         n_pad = int((out[0][:m_logical] == -1).sum().item())
+        row_topk = out[5][:m_logical]
+        real_row_topk = row_topk[out[0][:m_logical] >= 0]
+        if real_row_topk.numel() > 0:
+            assert int(real_row_topk.min().item()) >= topk_slot_offset
+            assert int(real_row_topk.max().item()) < topk_slot_offset + top_k
 
         # Warm up to fill JIT cache and CUDA contexts.
         _silent_warmup(fn, n=2)
@@ -154,11 +203,11 @@ def bench_one(num_ranks: int, tokens_per_rank: int, top_k: int,
         t_gpu_total = t_hist + t_prefix + t_fill + t_scat
 
         # 2) End-to-end wall time (includes alloc + JIT cache lookup +
-        # 3 launches + GPU work). This is what the caller pays.
+        # 4 launches + GPU work). This is what the caller pays.
         t_wall = bench(fn, num_warmups=5, num_tests=20)
 
         rows_kineto.append((
-            local_rank, m_logical, n_pad,
+            local_rank, topk_slot_offset, m_logical, n_pad,
             f'{t_hist * 1e6:.1f}',
             f'{t_prefix * 1e6:.1f}',
             f'{t_fill * 1e6:.1f}',
@@ -168,13 +217,13 @@ def bench_one(num_ranks: int, tokens_per_rank: int, top_k: int,
             f'{(t_wall - t_gpu_total) * 1e6:.1f}',
         ))
         rows_e2e.append((
-            local_rank, m_logical, n_pad,
+            local_rank, topk_slot_offset, m_logical, n_pad,
             f'{t_wall * 1e6:.1f}',
         ))
 
     _format_table(
         f'Per-kernel GPU time (kineto, avg of {num_kineto_tests}) — units: us',
-        ['local_rank', 'm_logical', 'n_pad',
+        ['local_rank', 'topk\noffset', 'm_logical', 'n_pad',
          'Phase1\nhist',
          'Phase2a\nprefix',
          'Phase2b\nfill',
@@ -199,13 +248,40 @@ def main(argv=None):
     parser.add_argument('--num-ranks', type=int, default=8)
     parser.add_argument('--top-k', type=int, default=16)
     parser.add_argument('--num-experts', type=int, default=512)
+    parser.add_argument('--routing-mode', type=str, default='random',
+                        choices=('random', 'all-ranks-local'),
+                        help='random: global random top-k; '
+                             'all-ranks-local: choose a fixed local top-k from every EP rank')
+    parser.add_argument('--global-num-experts', type=int, default=None,
+                        help='Global expert count for all-ranks-local routing. '
+                             'The local num_experts passed to the layout generator is global / num_ranks.')
+    parser.add_argument('--experts-per-rank-token', type=int, default=None,
+                        help='Local top-k for all-ranks-local routing. Defaults to --top-k / --num-ranks.')
     parser.add_argument('--block-m', type=int, default=128)
+    parser.add_argument('--expert-srank-padding', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='True: pad each (expert, source-rank) chunk; '
+                             'False: preserve rank-minor ordering but pad only at expert boundaries.')
     parser.add_argument('--num-kineto-tests', type=int, default=200)
     parser.add_argument('--all-local-ranks', action='store_true',
                         help='Bench every local_rank in [0, num_ranks). '
                              'By default we only bench local_rank=0 since '
                              'the per-rank cost barely changes.')
     args = parser.parse_args(argv)
+    bench_top_k = args.top_k
+    bench_num_experts = args.num_experts
+    if args.routing_mode == 'all-ranks-local':
+        if args.global_num_experts is not None:
+            if args.global_num_experts % args.num_ranks != 0:
+                raise ValueError('--global-num-experts must be divisible by --num-ranks')
+            bench_num_experts = args.global_num_experts
+        if args.experts_per_rank_token is None:
+            if args.top_k % args.num_ranks != 0:
+                raise ValueError('--top-k must be divisible by --num-ranks when --experts-per-rank-token is omitted')
+            local_top_k = args.top_k // args.num_ranks
+        else:
+            local_top_k = args.experts_per_rank_token
+        bench_top_k = local_top_k * args.num_ranks
 
     print('Library path:')
     print(f' > {deep_gemm.__path__[0]}')
@@ -219,9 +295,11 @@ def main(argv=None):
     bench_one(
         num_ranks=args.num_ranks,
         tokens_per_rank=args.tokens_per_rank,
-        top_k=args.top_k,
-        num_experts=args.num_experts,
+        top_k=bench_top_k,
+        num_experts=bench_num_experts,
         block_m=args.block_m,
+        routing_mode=args.routing_mode,
+        expert_srank_padding=args.expert_srank_padding,
         num_kineto_tests=args.num_kineto_tests,
         local_ranks=local_ranks,
     )

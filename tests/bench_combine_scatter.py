@@ -37,19 +37,25 @@ from generators import (  # noqa: E402
 )
 
 
-def _generate_distinct_routing_topk(num_tokens: int, top_k: int, num_experts: int, seed: int) -> torch.Tensor:
-    if top_k > num_experts:
-        raise ValueError(f'top_k ({top_k}) must be <= num_experts ({num_experts})')
+def _generate_all_ranks_local_routing_topk(num_tokens: int,
+                                           local_top_k: int,
+                                           global_num_experts: int,
+                                           num_ranks: int,
+                                           seed: int) -> torch.Tensor:
+    if global_num_experts % num_ranks != 0:
+        raise ValueError('global_num_experts must be divisible by num_ranks')
+    local_num_experts = global_num_experts // num_ranks
+    if local_top_k > local_num_experts:
+        raise ValueError(f'local_top_k ({local_top_k}) must be <= local experts ({local_num_experts})')
 
     gen = torch.Generator(device='cuda')
     gen.manual_seed(seed)
-    scores = torch.rand((num_tokens, num_experts), dtype=torch.float32,
+    scores = torch.rand((num_tokens, num_ranks, local_num_experts), dtype=torch.float32,
                         device='cuda', generator=gen)
-    return torch.topk(scores, top_k, dim=1).indices.to(torch.int32)
-
-
-def _align(value: int, alignment: int) -> int:
-    return ((value + alignment - 1) // alignment) * alignment
+    local_choices = torch.topk(scores, local_top_k, dim=2).indices
+    expert_offsets = torch.arange(num_ranks, device='cuda', dtype=torch.int64) * local_num_experts
+    routing_topk = local_choices + expert_offsets.view(1, num_ranks, 1)
+    return routing_topk.reshape(num_tokens, num_ranks * local_top_k).to(torch.int32)
 
 
 def _make_wgmma_n32_physical_to_logical_index(n: int, device: torch.device) -> torch.Tensor:
@@ -76,63 +82,6 @@ def _make_wgmma_n64_physical_to_logical_index(n: int, device: torch.device) -> t
     in_tile_logical = lane_group * 16 + half * 8 + pair * 2 + elem
     tile_base = torch.arange(0, n, 64, device=device).unsqueeze(1)
     return (tile_base + in_tile_logical.unsqueeze(0)).reshape(-1).to(torch.long)
-
-
-def _build_compact_gemm2_layout(routing_topk: torch.Tensor,
-                                rank: int,
-                                num_ranks: int,
-                                tokens_per_rank: int,
-                                local_top_k: int,
-                                num_experts: int,
-                                layout_order: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    alignment = deep_gemm_moe_L2.get_mk_alignment_for_contiguous_layout()
-    cursor = 0
-    psum_values: list[int] = []
-    row_chunks: list[tuple[int, torch.Tensor, torch.Tensor]] = []
-
-    for expert in range(num_experts):
-        cursor = _align(cursor, alignment)
-        if layout_order == 'token':
-            positions = (routing_topk == expert).nonzero(as_tuple=False)
-            src_tokens = positions[:, 0].to(torch.int32).contiguous()
-            topk_slots = (positions[:, 1].to(torch.int32) + rank * local_top_k).contiguous()
-        elif layout_order == 'ring':
-            src_chunks = []
-            topk_chunks = []
-            for step in range(num_ranks):
-                src_rank = (rank + step) % num_ranks
-                token_start = src_rank * tokens_per_rank
-                token_end = token_start + tokens_per_rank
-                positions = (routing_topk[token_start:token_end] == expert).nonzero(as_tuple=False)
-                if positions.numel() == 0:
-                    continue
-                src_chunks.append((positions[:, 0].to(torch.int32) + token_start).contiguous())
-                topk_chunks.append((positions[:, 1].to(torch.int32) + rank * local_top_k).contiguous())
-            if src_chunks:
-                src_tokens = torch.cat(src_chunks)
-                topk_slots = torch.cat(topk_chunks)
-            else:
-                src_tokens = torch.empty((0,), dtype=torch.int32, device=routing_topk.device)
-                topk_slots = torch.empty((0,), dtype=torch.int32, device=routing_topk.device)
-        else:
-            raise ValueError(f'unknown compact layout order: {layout_order}')
-        row_chunks.append((cursor, src_tokens, topk_slots))
-        cursor += int(src_tokens.numel())
-        psum_values.append(cursor)
-
-    m_logical = _align(cursor, alignment)
-    combine_src_index = torch.full((m_logical,), -1, dtype=torch.int32, device='cuda')
-    row_to_topk = torch.full((m_logical,), -1, dtype=torch.int32, device='cuda')
-    for start, src_tokens, topk_slots in row_chunks:
-        end = start + int(src_tokens.numel())
-        if end == start:
-            continue
-        combine_src_index[start:end] = src_tokens
-        row_to_topk[start:end] = topk_slots
-
-    psum_layout = torch.tensor(psum_values, dtype=torch.int32, device='cuda')
-    return combine_src_index, psum_layout, row_to_topk, m_logical
-
 
 def _rank0_print(rank: int, msg: str) -> None:
     if rank == 0:
@@ -388,24 +337,24 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     torch.manual_seed(0x2026)
     a_global_bf16 = torch.randn((total_tokens, hidden), dtype=torch.bfloat16, device='cuda')
 
-    routing_topk = _generate_distinct_routing_topk(total_tokens, combine_top_k, args.global_num_experts, seed=0xBEEF)
+    routing_topk = _generate_all_ranks_local_routing_topk(
+        total_tokens, local_top_k, args.global_num_experts, num_ranks, seed=0xBEEF)
     use_compact_gemm2_layout = args.no_gather_a and not args.rank_padded_gemm2_layout
+    expert_srank_padding = not use_compact_gemm2_layout
     if use_compact_gemm2_layout:
-        _rank0_print(rank, f'Building compact GEMM2 layout ({args.compact_layout_order} order)...')
-        combine_src_index, psum_layout, row_to_topk, m_logical = _build_compact_gemm2_layout(
-            routing_topk, rank, num_ranks, tokens_per_rank, local_top_k, num_experts,
-            args.compact_layout_order)
-        gather_index = combine_src_index
+        _rank0_print(rank, 'Building compact GEMM2 layout via gather-layout API...')
     else:
         _rank0_print(rank, 'Building rank-padded gather layout...')
-        gather_index, _tile_rank, _grouped_layout, m_logical_t, psum_layout, row_to_topk = \
-            deep_gemm_moe_L2.build_gather_layout_for_rank_overlap(
-                routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m,
-                topk_slot_offset=0)
-        m_logical = int(m_logical_t.item())
-        combine_src_index = gather_index
+
+    gather_index, _tile_rank, _grouped_layout, m_logical_t, psum_layout, row_to_topk = \
+        deep_gemm_moe_L2.build_gather_layout_for_rank_overlap(
+            routing_topk, rank, num_ranks, tokens_per_rank, num_experts, block_m,
+            topk_slot_offset=0,
+            expert_srank_padding=expert_srank_padding)
+    m_logical = int(m_logical_t.item())
+    combine_src_index = gather_index
     expected_m_per_expert = int((m_logical + num_experts - 1) // num_experts * 1.2)
-    real_rows = total_tokens * local_top_k
+    real_rows = int((combine_src_index[:m_logical] >= 0).sum().item())
     _rank0_print(rank, f'GEMM layout ready: m_logical={m_logical}, padding_rows={m_logical - real_rows}')
 
     if args.no_gather_a:
@@ -873,7 +822,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         print(f'  global_experts={args.global_num_experts}, local_experts={num_experts}, '
               f'global_top_k={combine_top_k}, local_top_k={local_top_k}', flush=True)
         print(f'  m_logical={m_logical}, n={args.n}, num_weights={args.num_weights}, n_eff={n_eff}', flush=True)
-        layout_name = f'compact-gemm2/{args.compact_layout_order}' if use_compact_gemm2_layout else 'rank-padded'
+        layout_name = 'compact-gemm2/expert-only-ring' if use_compact_gemm2_layout else 'rank-padded'
         print(f'  gather_a={not args.no_gather_a}, layout={layout_name}, '
               f'direct_accum_stg={args.combine_scatter_direct_accum_stg}, '
               f'fp8_scatter={args.combine_scatter_fp8}', flush=True)
@@ -944,9 +893,6 @@ def main() -> None:
     parser.add_argument('--rank-padded-gemm2-layout', action='store_true',
                         help='With --no-gather-a, keep the old rank-padded overlap layout instead of compact '
                              'expert-only GEMM2 layout')
-    parser.add_argument('--compact-layout-order', choices=('token', 'ring'), default='token',
-                        help='Row order for compact GEMM2 layout. token keeps global-token order; ring visits '
-                             'source ranks in local ring order inside each expert.')
     parser.add_argument('--bench-standalone-scatter', action='store_true',
                         help='Benchmark separate D -> peer combine-buffer scatter-copy and two-stage total')
     parser.add_argument('--bench-peer-tma-store', action='store_true',
