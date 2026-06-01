@@ -49,8 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n", type=int, default=2560)
     parser.add_argument("--num-experts", type=int, default=64,
                         help="Local expert count; customer global 512 experts / 8 ranks = 64.")
-    parser.add_argument("--top-k", type=int, default=2,
-                        help="Local top-k; customer global top-k 16 / 8 ranks = 2.")
+    parser.add_argument("--top-k", type=int, default=16,
+                        help="Global top-k")
     parser.add_argument("--block-m", type=int, default=128)
     parser.add_argument("--local-rank", type=int, default=0)
     parser.add_argument("--expert-srank-padding", action=argparse.BooleanOptionalAction,
@@ -171,6 +171,8 @@ def main() -> None:
     args = parse_args()
 
     total_tokens = args.num_ranks * args.tokens_per_rank
+    local_num_experts = args.num_experts
+    global_num_experts = args.num_ranks * args.num_experts
     quant_config = QuantConfig()
     recipe, recipe_a, recipe_b = quant_config.get_recipes()
 
@@ -190,7 +192,7 @@ def main() -> None:
 
     gen = torch.Generator(device="cuda").manual_seed(0xBEEF)
     scores = torch.rand(
-        (total_tokens, args.num_experts),
+        (total_tokens, global_num_experts),
         dtype=torch.float32,
         device="cuda",
         generator=gen,
@@ -203,7 +205,7 @@ def main() -> None:
             args.local_rank,
             args.num_ranks,
             args.tokens_per_rank,
-            args.num_experts,
+            local_num_experts,
             args.block_m,
             0,
             args.expert_srank_padding,
@@ -219,7 +221,7 @@ def main() -> None:
 
     torch.manual_seed(0x5678)
     b_bf16 = torch.randn(
-        (args.num_experts, args.n, args.hidden),
+        (local_num_experts, args.n, args.hidden),
         dtype=torch.bfloat16,
         device="cuda",
     )
@@ -234,7 +236,7 @@ def main() -> None:
 
     d = torch.empty((m_logical, args.n), dtype=torch.bfloat16, device="cuda")
     rank_flags = torch.ones((args.num_ranks,), dtype=torch.int64, device="cuda")
-    expected_m_per_expert = int((m_logical + args.num_experts - 1) // args.num_experts * 1.2)
+    expected_m_per_expert = int((m_logical + local_num_experts - 1) // local_num_experts * 1.2)
 
     needs_plain = args.check or "plain" in args.modes
     is_pad = None
