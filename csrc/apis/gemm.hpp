@@ -205,7 +205,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  const bool& combine_scatter_direct_accum_stg = false,
                                                  const bool& combine_scatter_fp8 = false,
                                                  const bool& use_tma_store = true,
-                                                 const std::optional<int64_t>& tma_store_ptr_override = std::nullopt) {
+                                                 const std::optional<int64_t>& tma_store_ptr_override = std::nullopt,
+                                                 const std::optional<torch::Tensor>& swiglu_output_scale = std::nullopt) {
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -219,9 +220,11 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     const auto [m_a, k] = check_ab_fp8_fp4(a.first, major_a, arch_major);
     const auto [num_groups, n, k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
     const auto [m_d, n_] = get_shape<2>(d);
-    DG_HOST_ASSERT(n == n_ and k == k_);
+    const bool fuse_swiglu = swiglu_output_scale.has_value();
+    DG_HOST_ASSERT((fuse_swiglu ? n == n_ * 2 : n == n_) and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(fuse_swiglu ? d.scalar_type() == torch::kFloat8_e4m3fn :
+                                 d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(grouped_layout.scalar_type() == torch::kInt);
     if (gather_index.has_value()) {
         DG_HOST_ASSERT(gather_index->is_cuda() and gather_index->is_contiguous());
@@ -334,7 +337,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                 has_combine_scatter and combine_scatter_direct_accum_stg,
                                                 has_combine_scatter and combine_scatter_fp8,
                                                 effective_use_tma_store,
-                                                tma_store_ptr_override);
+                                                tma_store_ptr_override,
+                                                swiglu_output_scale);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         DG_HOST_ASSERT(not gather_index.has_value());
         DG_HOST_ASSERT(not has_overlap);
@@ -793,7 +797,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("combine_scatter_direct_accum_stg") = false,
           py::arg("combine_scatter_fp8") = false,
           py::arg("use_tma_store") = true,
-          py::arg("tma_store_ptr_override") = std::nullopt);
+          py::arg("tma_store_ptr_override") = std::nullopt,
+          py::arg("swiglu_output_scale") = std::nullopt);
     m.def("m_grouped_fp8_fp4_gemm_nn_contiguous", &m_grouped_fp8_fp4_gemm_nn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,

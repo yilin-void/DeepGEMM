@@ -164,6 +164,7 @@ template <cute::UMMA::Major kMajorSFB,
           bool kCombineScatter,
           bool kCombineScatterDirectAccumStg,
           bool kCombineScatterFP8,
+          bool kFuseSwiGLU,
           bool kUseTMAStore,
           typename epilogue_type_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
@@ -199,12 +200,20 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         uint32_t combine_top_k,
                         nv_bfloat16* __restrict__ gmem_d,
                         uint32_t stride_d,
+                        float* __restrict__ gmem_d_scale,
+                        uint32_t stride_d_scale,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_d,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     static_assert(not kHasRankFlags or kHasGatherIndex, "rank flags require gather_index");
+    static_assert(not kFuseSwiGLU or (kHasGatherIndex and not kCombineScatter),
+                  "fused SwiGLU requires gather_index and is incompatible with combine-scatter");
+    static_assert(not kFuseSwiGLU or
+                  (BLOCK_M == 128 and BLOCK_N == 256 and BLOCK_K == 128 and
+                   kNumTMAMulticast == 1),
+                  "fused SwiGLU requires a single-CTA M128/N256/BK128 macro-tile");
 
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
@@ -213,7 +222,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         (math::constexpr_gcd(BLOCK_N, BLOCK_K) == BLOCK_N - BLOCK_K), "Too much B scales in a single block");
 
     // Types
-    using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_N>::type;
+    static constexpr uint32_t WGMMA_BLOCK_N = kFuseSwiGLU ? 128 : BLOCK_N;
+    using WGMMA = typename mma::sm90::FP8MMASelector<WGMMA_BLOCK_N>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     DG_STATIC_ASSERT(BLOCK_M % WGMMA::M == 0 or BLOCK_M < WGMMA::M, "Invalid block size");
 
@@ -224,7 +234,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
     // Shared memory
     static constexpr bool kMustUseUniformedScaleB = (BLOCK_K % BLOCK_N == 0);
-    static constexpr uint32_t SMEM_D_SIZE = math::constexpr_align(BLOCK_M * BLOCK_N * static_cast<uint32_t>(sizeof(__nv_bfloat16)), 1024u);
+    // The fused path keeps post-SwiGLU values in the accumulator registers and
+    // only stages the half-width FP8 output tile for vectorized global stores.
+    static constexpr uint32_t SMEM_D_SIZE = kFuseSwiGLU ?
+        math::constexpr_align(BLOCK_M * (BLOCK_N / 2) * static_cast<uint32_t>(sizeof(__nv_fp8_e4m3)), 1024u) :
+        math::constexpr_align(BLOCK_M * BLOCK_N * static_cast<uint32_t>(sizeof(__nv_bfloat16)), 1024u);
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * sizeof(float);
@@ -695,9 +709,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             }
             uint32_t num_sfb = shape_k_scales * (num_former_iters >= num_full_iters ? 1 : 2);
 
-            // Load B scales with math warp-groups
+            // Load B scales with math warp-groups. The fused path reads the
+            // original gate/up scales directly in the K loop because an
+            // interleaved N128 tile needs two distinct scale values.
             // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
-            if (threadIdx.x >= 32) {
+            if constexpr (not kFuseSwiGLU) if (threadIdx.x >= 32) {
                 auto previous_group_offset = scheduler.template get_global_idx<true, sched::IndexType::SF_K>(shape_n_sfb * shape_k_scales, 0, 0, m_block_idx);
                 const uint32_t stride_n_sfb = kMajorSFB == cute::UMMA::Major::MN ? 1 : shape_k_scales;
                 const uint32_t stride_k_sfb = kMajorSFB == cute::UMMA::Major::MN ? shape_n_sfb : 1;
@@ -707,7 +723,206 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 for (uint32_t i = threadIdx.x - 32; i < num_sfb; i += kNumMathThreads - 32)
                     ptx::st_shared(smem_sfb + i, i < shape_k_scales ? local_sfb[i * stride_k_sfb] : local_sfb[(i - shape_k_scales) * stride_k_sfb + stride_n_sfb]);
             }
-            cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+            if constexpr (not kFuseSwiGLU)
+                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+
+            if constexpr (kFuseSwiGLU) {
+                DG_STATIC_ASSERT(BLOCK_M == 128 and WGMMA::N == 128,
+                                 "N256 macro SwiGLU requires M128 and native N128 WGMMA");
+                DG_STATIC_ASSERT(WGMMA::kNumAccum / 4 == 16,
+                                 "unexpected N128 WGMMA accumulator layout");
+                constexpr uint32_t kNumNSubtiles = 2;
+                constexpr uint32_t kSwiGLUBlockNPerSubtile = WGMMA::N / 2;
+                constexpr uint32_t kSwiGLUBlockN = BLOCK_N / 2;
+                constexpr uint32_t kPairsPerThread = kSwiGLUBlockNPerSubtile / 8;
+                float macro_accum[kNumNSubtiles][WGMMA::kNumAccum] = {};
+                float macro_partial[WGMMA::kNumAccum];
+
+                auto macro_empty_barrier_arrive = [&]() {
+                    if (lane_idx == 0)
+                        empty_barriers[stage_idx]->arrive();
+                };
+                const bool is_computation_valid =
+                    scheduler.is_computation_valid(m_block_idx, math_wg_idx * WGMMA::M);
+
+                #pragma unroll 8
+                for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks;
+                     advance_pipeline(k_block_idx)) {
+                    const auto a_desc_base_lo =
+                        a_desc_lo + stage_idx * (SMEM_A_SIZE_PER_STAGE / 16);
+                    const auto b_desc_base_lo =
+                        b_desc_lo + stage_idx * (SMEM_B_SIZE_PER_STAGE / 16);
+                    full_barriers[stage_idx]->wait(phase);
+
+                    if (not is_computation_valid) {
+                        macro_empty_barrier_arrive();
+                        continue;
+                    }
+
+                    const float scale_a_0 = ptx::ld_shared(smem_sfa[stage_idx] + r_0);
+                    const float scale_a_1 = ptx::ld_shared(smem_sfa[stage_idx] + r_1);
+                    const uint32_t stride_n_sfb =
+                        kMajorSFB == cute::UMMA::Major::MN ? 1 : shape_k_scales;
+                    const uint32_t stride_k_sfb =
+                        kMajorSFB == cute::UMMA::Major::MN ? shape_n_sfb : 1;
+                    const uint32_t gate_n_block_idx = n_block_idx;
+                    const uint32_t up_n_block_idx = shape_n_sfb / 2 + gate_n_block_idx;
+                    const uint32_t group_offset =
+                        scheduler.template get_global_idx<true, sched::IndexType::SF_K>(
+                            shape_n_sfb * shape_k_scales, 0, 0, m_block_idx);
+                    const float* group_sfb = sfb + group_offset;
+                    const float gate_scale_b = __ldg(
+                        group_sfb + gate_n_block_idx * stride_n_sfb +
+                        k_block_idx * stride_k_sfb);
+                    const float up_scale_b = __ldg(
+                        group_sfb + up_n_block_idx * stride_n_sfb +
+                        k_block_idx * stride_k_sfb);
+                    const float gate_scale_0 = scale_a_0 * gate_scale_b;
+                    const float gate_scale_1 = scale_a_1 * gate_scale_b;
+                    const float up_scale_0 = scale_a_0 * up_scale_b;
+                    const float up_scale_1 = scale_a_1 * up_scale_b;
+
+                    #pragma unroll
+                    for (uint32_t subtile = 0; subtile < kNumNSubtiles; ++subtile) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                            ptx::warpgroup_fence_operand(macro_partial[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++k) {
+                            a_desc.reg32_[0] = a_desc_base_lo + k * WGMMA::K / 16;
+                            b_desc.reg32_[0] = b_desc_base_lo +
+                                (subtile * WGMMA::N * BLOCK_K + k * WGMMA::K) / 16;
+                            WGMMA::wgmma(a_desc, b_desc, macro_partial, k != 0);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum; ++i)
+                            ptx::warpgroup_fence_operand(macro_partial[i]);
+                        ptx::warpgroup_wait<0>();
+                        if (subtile == kNumNSubtiles - 1)
+                            macro_empty_barrier_arrive();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++i) {
+                            const float scale_0 = (i & 1u) ? up_scale_0 : gate_scale_0;
+                            const float scale_1 = (i & 1u) ? up_scale_1 : gate_scale_1;
+                            macro_accum[subtile][i * 4 + 0] +=
+                                macro_partial[i * 4 + 0] * scale_0;
+                            macro_accum[subtile][i * 4 + 1] +=
+                                macro_partial[i * 4 + 1] * scale_0;
+                            macro_accum[subtile][i * 4 + 2] +=
+                                macro_partial[i * 4 + 2] * scale_1;
+                            macro_accum[subtile][i * 4 + 3] +=
+                                macro_partial[i * 4 + 3] * scale_1;
+                        }
+                    }
+                }
+
+                float local_amax_0 = 0.0f;
+                float local_amax_1 = 0.0f;
+                #pragma unroll
+                for (uint32_t subtile = 0; subtile < kNumNSubtiles; ++subtile) {
+                    #pragma unroll
+                    for (uint32_t pair = 0; pair < kPairsPerThread; ++pair) {
+                        const uint32_t gate_base = (pair * 2 + 0) * 4;
+                        const uint32_t up_base = (pair * 2 + 1) * 4;
+                        const float gate_0_0 = __bfloat162float(
+                            __float2bfloat16_rn(macro_accum[subtile][gate_base + 0]));
+                        const float gate_0_1 = __bfloat162float(
+                            __float2bfloat16_rn(macro_accum[subtile][gate_base + 1]));
+                        const float gate_1_0 = __bfloat162float(
+                            __float2bfloat16_rn(macro_accum[subtile][gate_base + 2]));
+                        const float gate_1_1 = __bfloat162float(
+                            __float2bfloat16_rn(macro_accum[subtile][gate_base + 3]));
+                        const float up_0_0 = __bfloat162float(
+                            __float2bfloat16_rn(macro_accum[subtile][up_base + 0]));
+                        const float up_0_1 = __bfloat162float(
+                            __float2bfloat16_rn(macro_accum[subtile][up_base + 1]));
+                        const float up_1_0 = __bfloat162float(
+                            __float2bfloat16_rn(macro_accum[subtile][up_base + 2]));
+                        const float up_1_1 = __bfloat162float(
+                            __float2bfloat16_rn(macro_accum[subtile][up_base + 3]));
+                        const float value_0_0 =
+                            __fdividef(gate_0_0, 1.0f + __expf(-gate_0_0)) * up_0_0;
+                        const float value_0_1 =
+                            __fdividef(gate_0_1, 1.0f + __expf(-gate_0_1)) * up_0_1;
+                        const float value_1_0 =
+                            __fdividef(gate_1_0, 1.0f + __expf(-gate_1_0)) * up_1_0;
+                        const float value_1_1 =
+                            __fdividef(gate_1_1, 1.0f + __expf(-gate_1_1)) * up_1_1;
+                        macro_accum[subtile][gate_base + 0] = value_0_0;
+                        macro_accum[subtile][gate_base + 1] = value_0_1;
+                        macro_accum[subtile][gate_base + 2] = value_1_0;
+                        macro_accum[subtile][gate_base + 3] = value_1_1;
+                        local_amax_0 = cute::max(
+                            local_amax_0, cute::max(fabsf(value_0_0), fabsf(value_0_1)));
+                        local_amax_1 = cute::max(
+                            local_amax_1, cute::max(fabsf(value_1_0), fabsf(value_1_1)));
+                    }
+                }
+                local_amax_0 = math::warp_reduce<4, false>(
+                    local_amax_0, math::ReduceMax<float>{});
+                local_amax_1 = math::warp_reduce<4, false>(
+                    local_amax_1, math::ReduceMax<float>{});
+                const float scale_0 = cute::max(local_amax_0, 1.0e-4f) * (1.0f / 448.0f);
+                const float scale_1 = cute::max(local_amax_1, 1.0e-4f) * (1.0f / 448.0f);
+                const float inv_scale_0 = 1.0f / scale_0;
+                const float inv_scale_1 = 1.0f / scale_1;
+                const uint32_t base_m_idx =
+                    scheduler.get_global_idx<false>(shape_m, BLOCK_M, m_block_idx);
+                if ((lane_idx & 3u) == 0) {
+                    if (base_m_idx + r_0 < shape_m)
+                        gmem_d_scale[n_block_idx * stride_d_scale + base_m_idx + r_0] = scale_0;
+                    if (base_m_idx + r_1 < shape_m)
+                        gmem_d_scale[n_block_idx * stride_d_scale + base_m_idx + r_1] = scale_1;
+                }
+
+                auto* smem_swiglu = reinterpret_cast<__nv_fp8_e4m3*>(smem_d);
+                #pragma unroll
+                for (uint32_t subtile = 0; subtile < kNumNSubtiles; ++subtile) {
+                    #pragma unroll
+                    for (uint32_t pair = 0; pair < kPairsPerThread; ++pair) {
+                        const uint32_t value_base = (pair * 2) * 4;
+                        const auto q0 = __nv_fp8x2_e4m3(make_float2(
+                            macro_accum[subtile][value_base + 0] * inv_scale_0,
+                            macro_accum[subtile][value_base + 1] * inv_scale_0));
+                        const auto q1 = __nv_fp8x2_e4m3(make_float2(
+                            macro_accum[subtile][value_base + 2] * inv_scale_1,
+                            macro_accum[subtile][value_base + 3] * inv_scale_1));
+                        const uint32_t col = subtile * kSwiGLUBlockNPerSubtile +
+                            pair * 8 + (lane_idx & 3u) * 2;
+                        *reinterpret_cast<uint16_t*>(
+                            smem_swiglu + r_0 * kSwiGLUBlockN + col) =
+                            *reinterpret_cast<const uint16_t*>(&q0);
+                        *reinterpret_cast<uint16_t*>(
+                            smem_swiglu + r_1 * kSwiGLUBlockN + col) =
+                            *reinterpret_cast<const uint16_t*>(&q1);
+                    }
+                }
+                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 1);
+
+                constexpr uint32_t kStoreVecElems = 16;
+                constexpr uint32_t kVecsPerRow = kSwiGLUBlockN / kStoreVecElems;
+                auto* gmem_d_fp8 = reinterpret_cast<__nv_fp8_e4m3*>(gmem_d);
+                for (uint32_t linear = threadIdx.x; linear < BLOCK_M * kVecsPerRow;
+                     linear += kNumMathThreads) {
+                    const uint32_t row = linear / kVecsPerRow;
+                    const uint32_t vec = linear - row * kVecsPerRow;
+                    const uint32_t logical_m = base_m_idx + row;
+                    if (logical_m >= shape_m)
+                        continue;
+                    const auto* src =
+                        smem_swiglu + row * kSwiGLUBlockN + vec * kStoreVecElems;
+                    const uint4 packed = *reinterpret_cast<const uint4*>(src);
+                    const uint32_t output_col =
+                        n_block_idx * kSwiGLUBlockN + vec * kStoreVecElems;
+                    *reinterpret_cast<uint4*>(
+                        gmem_d_fp8 + static_cast<uint64_t>(logical_m) * stride_d + output_col) =
+                        packed;
+                }
+                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 1);
+                continue;
+            }
 
             // Accumulation for WGMMA or CUDA promotion
             constexpr uint32_t WAVE_BLOCK_M = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * 2;

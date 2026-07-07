@@ -49,8 +49,11 @@ public:
         uint32_t combine_top_k;
         void *gmem_d;
         uint32_t stride_d;
+        void *gmem_d_scale;
+        uint32_t stride_d_scale;
         bool combine_scatter_direct_accum_stg;
         bool combine_scatter_fp8;
+        bool fuse_swiglu;
         bool use_tma_store;
         // TMA descriptors kept for reference (A/sfa currently unused in kernel)
         CUtensorMap tensor_map_a;
@@ -81,6 +84,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -103,6 +107,7 @@ static void __instantiate_kernel() {{
         args.combine_row_topk != nullptr,
         args.combine_scatter_direct_accum_stg,
         args.combine_scatter_fp8,
+        args.fuse_swiglu,
         args.use_tma_store,
         get_default_epilogue_type(args.epilogue_type));
     }
@@ -119,6 +124,7 @@ static void __instantiate_kernel() {{
             args.combine_row_topk, args.combine_buffer_ptrs, args.combine_scale_ptrs,
             args.combine_tokens_per_rank, args.combine_top_k,
             args.gmem_d, args.stride_d,
+            args.gmem_d_scale, args.stride_d_scale,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_d, args.tensor_map_sfa));
     }
@@ -248,8 +254,11 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .combine_top_k = 0u,
         .gmem_d = d.data_ptr(),
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .gmem_d_scale = nullptr,
+        .stride_d_scale = 0u,
         .combine_scatter_direct_accum_stg = false,
         .combine_scatter_fp8 = false,
+        .fuse_swiglu = false,
         .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -286,8 +295,11 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const bool& combine_scatter_direct_accum_stg = false,
                                                     const bool& combine_scatter_fp8 = false,
                                                     const bool& use_tma_store = true,
-                                                    const std::optional<int64_t>& tma_store_ptr_override = std::nullopt) {
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+                                                    const std::optional<int64_t>& tma_store_ptr_override = std::nullopt,
+                                                    const std::optional<torch::Tensor>& swiglu_output_scale = std::nullopt) {
+    const bool fuse_swiglu = swiglu_output_scale.has_value();
+    DG_HOST_ASSERT(fuse_swiglu ? d.scalar_type() == torch::kFloat8_e4m3fn :
+                                 d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
     if (gather_index.has_value()) {
         DG_HOST_ASSERT(gather_index->is_cuda() and gather_index->is_contiguous());
@@ -358,6 +370,25 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         DG_HOST_ASSERT(not combine_scatter_fp8);
     }
 
+    if (fuse_swiglu) {
+        DG_HOST_ASSERT(gather_index.has_value() and use_psum_layout);
+        DG_HOST_ASSERT(not has_combine_scatter);
+        DG_HOST_ASSERT(not tma_store_ptr_override.has_value());
+        DG_HOST_ASSERT(n % 256 == 0 and "fused SwiGLU requires pairs of raw N128 tiles");
+        DG_HOST_ASSERT(k % 128 == 0);
+        DG_HOST_ASSERT(static_cast<int>(d.size(0)) == m and static_cast<int>(d.size(1)) == n / 2);
+        DG_HOST_ASSERT(d.is_cuda() and d.is_contiguous());
+        DG_HOST_ASSERT(swiglu_output_scale->is_cuda());
+        DG_HOST_ASSERT(swiglu_output_scale->scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(swiglu_output_scale->dim() == 2);
+        DG_HOST_ASSERT(static_cast<int>(swiglu_output_scale->size(0)) == m);
+        DG_HOST_ASSERT(static_cast<int>(swiglu_output_scale->size(1)) == n / 256);
+        DG_HOST_ASSERT(swiglu_output_scale->stride(0) == 1 and
+                       "fused SwiGLU scales must use MN-major storage");
+        DG_HOST_ASSERT(swiglu_output_scale->stride(1) >= m);
+        DG_HOST_ASSERT(swiglu_output_scale->get_device() == d.get_device());
+    }
+
     const auto gemm_type = use_psum_layout ?
         GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous;
 
@@ -370,7 +401,9 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .kernel_type = KernelType::Kernel1D2D,
         .m = m, .n = n, .k = k, .num_groups = num_groups,
         .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
-        .cd_dtype = d.scalar_type(),
+        // GemmDesc currently only accepts BF16/FP32 C/D types. The fused
+        // specialization supplies its own FP8 storage configuration below.
+        .cd_dtype = fuse_swiglu ? torch::kBFloat16 : d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = false,
         .num_sms = device_runtime->get_num_sms(),
@@ -379,7 +412,40 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .expected_n = n, .expected_k = k,
         .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1
     };
-    const auto config = get_best_config<SM90ArchSpec>(desc);
+    const auto config = [&]() {
+        if (not fuse_swiglu)
+            return get_best_config<SM90ArchSpec>(desc);
+
+        // One CTA computes a raw N256 tile with two native N128 WGMMAs, then
+        // reduces and quantizes the resulting N128 SwiGLU tile locally.
+        const Layout layout{0, 128, 256, 128, 1, 1};
+        auto storage = SM90ArchSpec::get_storage_config(desc, layout);
+        storage.store_block_n = 128;
+        storage.swizzle_cd_mode = 0;
+        auto pipeline = SM90ArchSpec::get_pipeline_config(desc, layout, storage);
+        const int num_stages = 4;
+        const int smem_d = align(128 * 128 * static_cast<int>(sizeof(uint8_t)), 1024);
+        const int smem_per_stage =
+            128 * 128 + 256 * 128 + align(128 * 4, 128);
+        const int smem_sfb_rows = 2;
+        const int smem_sfb = align(
+            ceil_div(desc.k, 128) * smem_sfb_rows * static_cast<int>(sizeof(float)), 8);
+        const int smem_barriers = 2 * num_stages * 8;
+        const int smem_tail = 8 * static_cast<int>(sizeof(uint32_t));
+        pipeline = {
+            .smem_size = align(
+                smem_d + num_stages * smem_per_stage + smem_sfb +
+                smem_barriers + smem_tail,
+                1024),
+            .num_stages = num_stages,
+        };
+        return GemmConfig{
+            .layout = layout,
+            .storage_config = storage,
+            .pipeline_config = pipeline,
+            .launch_config = SM90ArchSpec::get_launch_config(desc, layout),
+        };
+    }();
 
     // Requires no TMA splits
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
@@ -406,7 +472,8 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         ? reinterpret_cast<void*>(static_cast<uintptr_t>(tma_store_ptr_override.value()))
         : d.data_ptr();
     const auto tensor_map_d = make_tma_cd_desc_from_ptr(tensor_map_d_base, d.scalar_type(),
-                                                        static_cast<int>(d.element_size()), m, n,
+                                                        static_cast<int>(d.element_size()), m,
+                                                        fuse_swiglu ? n / 2 : n,
                                                         config.storage_config.store_block_m,
                                                         config.storage_config.store_block_n,
                                                         static_cast<int>(d.stride(-2)), 1,
@@ -447,9 +514,12 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .combine_top_k = has_combine_scatter ? static_cast<uint32_t>(combine_top_k.value()) : 0u,
         .gmem_d = tensor_map_d_base,
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .gmem_d_scale = fuse_swiglu ? swiglu_output_scale->data_ptr() : nullptr,
+        .stride_d_scale = fuse_swiglu ? static_cast<uint32_t>(swiglu_output_scale->stride(1)) : 0u,
         .combine_scatter_direct_accum_stg = has_combine_scatter and combine_scatter_direct_accum_stg,
         .combine_scatter_fp8 = has_combine_scatter and combine_scatter_fp8,
-        .use_tma_store = use_tma_store,
+        .fuse_swiglu = fuse_swiglu,
+        .use_tma_store = fuse_swiglu ? false : use_tma_store,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
@@ -537,8 +607,11 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .combine_top_k = 0u,
         .gmem_d = d.data_ptr(),
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .gmem_d_scale = nullptr,
+        .stride_d_scale = 0u,
         .combine_scatter_direct_accum_stg = false,
         .combine_scatter_fp8 = false,
+        .fuse_swiglu = false,
         .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -633,8 +706,11 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .combine_top_k = 0u,
         .gmem_d = d.data_ptr(),
         .stride_d = static_cast<uint32_t>(d.stride(-2)),
+        .gmem_d_scale = nullptr,
+        .stride_d_scale = 0u,
         .combine_scatter_direct_accum_stg = false,
         .combine_scatter_fp8 = false,
+        .fuse_swiglu = false,
         .use_tma_store = true,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
