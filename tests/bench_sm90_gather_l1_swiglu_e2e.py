@@ -1,8 +1,9 @@
 """End-to-end SM90 MoE benchmark for gather-L1 + SwiGLU fusion.
 
-Both paths use the same direct C++ NCCL all-gather dispatch, FP8 L2
-combine-scatter epilogue, and local scored reduction.  They differ only in
-whether gather-L1 and SwiGLU quantization are separate kernels or fused.
+Both paths use the same direct C++ NCCL all-gather dispatch, selected BF16 or
+FP8 L2 combine-scatter epilogue, and matching local scored reduction. They
+differ only in whether gather-L1 and SwiGLU quantization are separate kernels
+or fused.
 """
 
 import argparse
@@ -77,6 +78,20 @@ def _make_wgmma_n64_physical_to_logical_index(
     elem = in_half % 2
     logical = lane_group * 16 + half * 8 + pair * 2 + elem
     tile_base = torch.arange(0, n, 64, device=device).unsqueeze(1)
+    return (tile_base + logical.unsqueeze(0)).reshape(-1).to(torch.long)
+
+
+def _make_wgmma_n32_physical_to_logical_index(
+    n: int, device: torch.device
+) -> torch.Tensor:
+    if n % 32 != 0:
+        raise ValueError(f"N must be divisible by 32 for BF16 combine-scatter, got {n}")
+    physical = torch.arange(32, device=device)
+    pair = physical // 8
+    lane_group = (physical % 8) // 2
+    elem = physical % 2
+    logical = lane_group * 8 + pair * 2 + elem
+    tile_base = torch.arange(0, n, 32, device=device).unsqueeze(1)
     return (tile_base + logical.unsqueeze(0)).reshape(-1).to(torch.long)
 
 
@@ -177,6 +192,9 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         raise ValueError("top-k must equal experts-per-rank-token * num-local-ranks")
     if args.hidden % 128 != 0 or args.intermediate % 128 != 0:
         raise ValueError("hidden and intermediate must be divisible by 128")
+    if args.scatter_dtype not in ("bf16", "fp8"):
+        raise ValueError("worker scatter-dtype must be bf16 or fp8")
+    scatter_fp8 = args.scatter_dtype == "fp8"
 
     unique_ids = [deep_gemm.nccl_get_unique_id() if rank == 0 else None]
     dist.broadcast_object_list(unique_ids, src=0, group=group)
@@ -253,9 +271,11 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         device="cuda",
         dtype=torch.bfloat16,
     ) * 0.1
-    l2_permutation = _make_wgmma_n64_physical_to_logical_index(
-        args.hidden, l2_weight_bf16.device
-    )
+    l2_permutation = (
+        _make_wgmma_n64_physical_to_logical_index
+        if scatter_fp8
+        else _make_wgmma_n32_physical_to_logical_index
+    )(args.hidden, l2_weight_bf16.device)
     l2_weight_bf16 = l2_weight_bf16.index_select(1, l2_permutation).contiguous()
     l2_weights = grouped_cast_fp8_fp4_with_major(
         l2_weight_bf16,
@@ -287,13 +307,15 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     combine_buffer = torch.empty(
         (args.tokens_per_rank, args.top_k, args.hidden),
         device="cuda",
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.float8_e4m3fn if scatter_fp8 else torch.bfloat16,
     )
-    combine_scales = torch.empty(
-        (args.tokens_per_rank, args.top_k, args.hidden // 32),
-        device="cuda",
-        dtype=torch.float32,
-    )
+    combine_scales = None
+    if scatter_fp8:
+        combine_scales = torch.empty(
+            (args.tokens_per_rank, args.top_k, args.hidden // 32),
+            device="cuda",
+            dtype=torch.float32,
+        )
     combine_handles = [None] * num_ranks
     dist.all_gather_object(
         combine_handles, deep_gemm.cuda_ipc_get_mem_handle(combine_buffer), group=group
@@ -301,15 +323,17 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     combine_ptrs = deep_gemm.cuda_ipc_open_mem_handles(
         combine_handles, rank, combine_buffer
     )
-    scale_handles = [None] * num_ranks
-    dist.all_gather_object(
-        scale_handles, deep_gemm.cuda_ipc_get_mem_handle(combine_scales), group=group
-    )
-    scale_ptrs = deep_gemm.cuda_ipc_open_mem_handles(
-        scale_handles, rank, combine_scales
-    )
     combine_ptrs_tensor = torch.tensor(combine_ptrs, device="cuda", dtype=torch.int64)
-    scale_ptrs_tensor = torch.tensor(scale_ptrs, device="cuda", dtype=torch.int64)
+    scale_ptrs_tensor = None
+    if scatter_fp8:
+        scale_handles = [None] * num_ranks
+        dist.all_gather_object(
+            scale_handles, deep_gemm.cuda_ipc_get_mem_handle(combine_scales), group=group
+        )
+        scale_ptrs = deep_gemm.cuda_ipc_open_mem_handles(
+            scale_handles, rank, combine_scales
+        )
+        scale_ptrs_tensor = torch.tensor(scale_ptrs, device="cuda", dtype=torch.int64)
     final_output = torch.empty(
         (args.tokens_per_rank, args.hidden), device="cuda", dtype=torch.float32
     )
@@ -335,13 +359,14 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         combine_src_index=gather_index,
         combine_row_topk=row_to_topk,
         combine_buffer_ptrs=combine_ptrs_tensor,
-        combine_scale_ptrs=scale_ptrs_tensor,
         combine_tokens_per_rank=args.tokens_per_rank,
         combine_top_k=args.top_k,
         combine_scatter_direct_accum_stg=True,
-        combine_scatter_fp8=True,
+        combine_scatter_fp8=scatter_fp8,
         use_tma_store=False,
     )
+    if scatter_fp8:
+        l2_kwargs["combine_scale_ptrs"] = scale_ptrs_tensor
 
     comm_stream = torch.cuda.Stream()
     compute_stream = torch.cuda.Stream()
@@ -378,9 +403,14 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         )
 
     def launch_local_combine() -> None:
-        deep_gemm.combine_reduce_slots_fp8(
-            combine_buffer, combine_scales, local_topk_scores, final_output
-        )
+        if scatter_fp8:
+            deep_gemm.combine_reduce_slots_fp8(
+                combine_buffer, combine_scales, local_topk_scores, final_output
+            )
+        else:
+            deep_gemm.combine_reduce_slots(
+                combine_buffer, local_topk_scores, final_output
+            )
 
     def run_dispatch() -> None:
         enqueue_dispatch()
@@ -542,6 +572,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         )
         print(
             f"  H={args.hidden}, I={args.intermediate}, top_k={args.top_k}, "
+            f"scatter_dtype={args.scatter_dtype}, "
             f"swiglu_block_n={os.getenv('DG_SM90_SWIGLU_BLOCK_N', '256')}",
             flush=True,
         )
@@ -584,6 +615,9 @@ def main() -> None:
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument(
+        "--scatter-dtype", choices=("bf16", "fp8", "both"), default="both"
+    )
+    parser.add_argument(
         "--dispatch-scales", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
@@ -595,8 +629,19 @@ def main() -> None:
     _set_default_nccl_ctas()
     if args.num_local_ranks < 1 or args.num_local_ranks > torch.cuda.device_count():
         raise ValueError("invalid num-local-ranks")
-    args.port = _free_port()
-    mp.spawn(_worker, args=(args.num_local_ranks, args), nprocs=args.num_local_ranks)
+    scatter_dtypes = (
+        ("bf16", "fp8") if args.scatter_dtype == "both" else (args.scatter_dtype,)
+    )
+    for scatter_dtype in scatter_dtypes:
+        run_args = argparse.Namespace(**vars(args))
+        run_args.scatter_dtype = scatter_dtype
+        run_args.port = _free_port()
+        print(f"Running L2 scatter dtype: {scatter_dtype}", flush=True)
+        mp.spawn(
+            _worker,
+            args=(run_args.num_local_ranks, run_args),
+            nprocs=run_args.num_local_ranks,
+        )
 
 
 if __name__ == "__main__":

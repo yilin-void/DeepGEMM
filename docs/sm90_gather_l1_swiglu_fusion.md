@@ -178,61 +178,68 @@ construction, weight preprocessing, and tensor allocation remain outside the
 timed region. This isolates execution of an already-routed MoE layer rather than
 gate or setup work.
 
-L2 uses the existing FP8 direct-accumulator scatter epilogue. Every rank writes
-its output rows directly into the owning rank's CUDA-IPC combine buffer, with an
-FP32 scale per 32 output columns. The timed path synchronizes all outbound peer
-stores before launching `combine_reduce_slots_fp8`; this synchronization is
-required for correctness and is included in both paths. Top-k weights are first
-applied by the local combine kernel, not by the L2 epilogue.
+L2 supports both existing direct-accumulator scatter epilogues. The BF16 mode
+uses the N32 weight permutation, writes BF16 values to the peer CUDA-IPC buffer,
+and calls `combine_reduce_slots`. The FP8 mode uses the N64 permutation, writes
+E4M3 values plus one FP32 scale per 32 output columns, and calls
+`combine_reduce_slots_fp8`. The timed path synchronizes all outbound peer stores
+before local combine; this synchronization is required for correctness and is
+included in both paths. Top-k weights are first applied by the local combine
+kernel, not by either L2 epilogue.
 
 For the target 8-H200 workload, the logical M values were
 `[115584, 115200, 115584, 115328, 115328, 115072, 115456, 115328]`. The following
-numbers use the maximum across per-rank medians as the critical latency. The
-component median column is diagnostic and should not be summed: isolated stages
-have different cache state and do not include the same cross-rank arrival skew.
+numbers use the maximum across per-rank medians as the critical latency.
+Components are diagnostic and should not be summed: isolated stages have
+different cache state and do not include the same cross-rank arrival skew.
 
 ```text
-stage                                      rank median      critical
-NCCL dispatch                                  356.11 us      358.52 us
-baseline gather L1 + SwiGLU                   1277.97 us     1300.28 us
-fused gather L1 + SwiGLU                      1248.18 us     1316.68 us
-L2 + remote scatter + peer completion         1227.77 us     1228.29 us
-local combine                                  191.53 us      195.87 us
-baseline L1/SwiGLU + L2/scatter chain         2523.55 us     2531.23 us
-fused L1/SwiGLU + L2/scatter chain            2444.05 us     2448.29 us
-baseline full pipeline                        3039.96 us     3043.29 us
-fused full pipeline                           2901.58 us     2903.42 us
+stage                                      BF16 critical    FP8 critical
+NCCL dispatch                                  359.87 us       357.38 us
+baseline gather L1 + SwiGLU                   1300.93 us      1305.65 us
+fused gather L1 + SwiGLU                      1311.06 us      1303.89 us
+L2 + remote scatter + peer completion         1511.32 us      1224.26 us
+local combine                                  167.71 us       192.36 us
+baseline L1/SwiGLU + L2/scatter chain         2795.88 us      2530.11 us
+fused L1/SwiGLU + L2/scatter chain            2662.29 us      2459.09 us
+baseline full pipeline                        3287.97 us      3040.22 us
+fused full pipeline                           3136.39 us      2897.83 us
+fusion speedup                                   1.048x          1.049x
+critical time saved                            151.59 us       142.38 us
 ```
 
-The full-pipeline result is `1.048x`, saving `139.87 us` on the critical rank.
-A second full-only run measured `3018.77 us -> 2881.06 us`, also `1.048x`; an
-earlier run measured `1.044x`. With the legacy all-gather benchmark convention
-that communicates FP8 data but pre-populates scales, the result was
-`2997.01 us -> 2849.47 us`, or `1.052x`.
+The full-only repeat measured `3317.35 us -> 3166.89 us` for BF16 (`1.048x`)
+and `3023.08 us -> 2888.33 us` for FP8 (`1.047x`). FP8 makes the L2/scatter
+stage about 287 us faster than BF16 in the component run. Its dequantizing local
+combine is about 25 us slower, but the complete fused path is still about 239 us
+faster. The reduced remote payload is the likely primary contributor.
 
-The integrated compute chain saves about 83 us even though the isolated
-L1/SwiGLU microbenchmark saves only about 25-30 us in current reruns. This shows
-that removing the large BF16 intermediate affects the immediately following L2
-execution and/or cross-rank arrival behavior. Cache residency and memory-system
-state are plausible contributors, but attributing the difference precisely
-requires a kernel timeline and hardware-counter profile; the benchmark only
-establishes the integrated effect.
+For both scatter precisions, the integrated compute chain saves more time than
+the isolated L1/SwiGLU microbenchmark. This shows that removing the large BF16
+intermediate affects the immediately following L2 execution and/or cross-rank
+arrival behavior. Cache residency and memory-system state are plausible
+contributors, but attributing the difference precisely requires a kernel
+timeline and hardware-counter profile; the benchmark only establishes the
+integrated effect.
 
 The final FP32 local-combine output was compared after running both complete
 paths from the same dispatched input, routing, weights, and top-k scores. The
-eight-rank aggregate metrics were:
+eight-rank aggregate metrics were as follows. Each column compares fused against
+the unfused baseline using the same scatter precision; it is not a BF16-versus-
+FP8 output comparison.
 
 ```text
-normalized difference       2.502e-08
-mean absolute error         4.071e-04
-maximum absolute error      1.074e+01
-exact mismatch rate         5.240e-03
-reference absolute mean     9.361e+01
+metric                         BF16             FP8
+normalized difference       3.280e-09       2.502e-08
+mean absolute error         3.026e-04       4.071e-04
+maximum absolute error      2.540e+00       1.074e+01
+exact mismatch rate         2.341e-03       5.240e-03
+reference absolute mean     9.362e+01       9.361e+01
 ```
 
-The exact mismatch rate includes small L2 FP8 bin-boundary changes propagated
-through local combine. The normalized and mean errors remain small relative to
-the output magnitude.
+The exact mismatch rates include small L1 FP8 bin-boundary changes propagated
+through L2 and local combine. The normalized and mean errors remain small
+relative to the output magnitude.
 
 ## Commands
 
@@ -281,13 +288,15 @@ python3 tests/bench_sm90_gather_l1_swiglu_e2e.py \
   --top-k 16 \
   --global-num-experts 512 \
   --experts-per-rank-token 2 \
+  --scatter-dtype both \
   --warmups 5 \
   --iters 20 \
   --check
 ```
 
-Use `--no-dispatch-scales` to reproduce the older all-gather benchmark's
-data-only dispatch convention, and `--no-components` to skip diagnostic stage
+`--scatter-dtype` accepts `bf16`, `fp8`, or `both` and defaults to `both`. Use
+`--no-dispatch-scales` to reproduce the older all-gather benchmark's data-only
+dispatch convention, and `--no-components` to skip diagnostic stage
 measurements while retaining the balanced full-path comparison.
 
 Run the retained N128 cluster comparison by prefixing the same command with:
