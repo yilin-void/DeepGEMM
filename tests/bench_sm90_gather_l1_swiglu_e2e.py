@@ -377,11 +377,17 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             if args.dispatch_scales:
                 deep_gemm.nccl_allgather_bytes(sfa_local, sfa_pool, nccl_comm)
 
-    def launch_baseline_middle() -> None:
+    def launch_gather_l1() -> None:
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             (a_pool, sfa_pool), l1_weights, l1_output, psum_layout, **l1_kwargs
         )
+
+    def launch_swiglu() -> None:
         swiglu_quant_fp8(l1_output, activation, activation_scale)
+
+    def launch_baseline_middle() -> None:
+        launch_gather_l1()
+        launch_swiglu()
 
     def launch_fused_middle() -> None:
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
@@ -415,6 +421,16 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
     def run_dispatch() -> None:
         enqueue_dispatch()
         torch.cuda.current_stream().wait_stream(comm_stream)
+
+    def run_gather_l1() -> None:
+        with torch.cuda.stream(compute_stream):
+            launch_gather_l1()
+        torch.cuda.current_stream().wait_stream(compute_stream)
+
+    def run_swiglu() -> None:
+        with torch.cuda.stream(compute_stream):
+            launch_swiglu()
+        torch.cuda.current_stream().wait_stream(compute_stream)
 
     def run_baseline_middle() -> None:
         with torch.cuda.stream(compute_stream):
@@ -519,11 +535,11 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         timings["dispatch"] = _bench(
             run_dispatch, args.warmups, args.iters, group
         )
-        timings["baseline_gather_l1_swiglu"] = _bench(
-            run_baseline_middle, args.warmups, args.iters, group
+        timings["gather_l1"] = _bench(
+            run_gather_l1, args.warmups, args.iters, group
         )
-        timings["fused_gather_l1_swiglu"] = _bench(
-            run_fused_middle, args.warmups, args.iters, group
+        timings["swiglu"] = _bench(
+            run_swiglu, args.warmups, args.iters, group
         )
         timings["l2_scatter_and_peer_sync"] = _bench(
             run_l2_scatter, args.warmups, args.iters, group
@@ -531,6 +547,15 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         timings["local_combine"] = _bench(
             run_local_combine, args.warmups, args.iters, group
         )
+        baseline_middle, fused_middle = _bench_balanced_pair(
+            run_baseline_middle,
+            run_fused_middle,
+            args.warmups,
+            args.iters,
+            group,
+        )
+        timings["baseline_gather_l1_swiglu"] = baseline_middle
+        timings["fused_gather_l1_swiglu"] = fused_middle
         baseline_chain, fused_chain = _bench_balanced_pair(
             run_baseline_compute_chain,
             run_fused_compute_chain,
@@ -572,8 +597,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
         )
         print(
             f"  H={args.hidden}, I={args.intermediate}, top_k={args.top_k}, "
-            f"scatter_dtype={args.scatter_dtype}, "
-            f"swiglu_block_n={os.getenv('DG_SM90_SWIGLU_BLOCK_N', '256')}",
+            f"scatter_dtype={args.scatter_dtype}",
             flush=True,
         )
         print(
@@ -582,18 +606,81 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             f"nccl_ctas={os.environ['NCCL_MIN_CTAS']}/{os.environ['NCCL_MAX_CTAS']}",
             flush=True,
         )
-        print("  rank-median latency (critical=max rank):", flush=True)
         names = list(timings)
-        for index, name in enumerate(names):
-            values_us = all_medians[:, index] * 1000.0
+
+        def get_values_us(name: str) -> torch.Tensor:
+            return all_medians[:, names.index(name)] * 1000.0
+
+        def print_pipeline(
+            label: str,
+            stages: tuple[tuple[str, str], ...],
+            full_name: str,
+        ) -> None:
+            print(f"  {label} ({len(stages)} stages):", flush=True)
+            stage_sum = torch.zeros(num_ranks, dtype=torch.float64)
+            for stage_index, (stage_label, timing_name) in enumerate(stages, start=1):
+                values_us = get_values_us(timing_name)
+                stage_sum += values_us
+                print(
+                    f"    [{stage_index}/{len(stages)}] {stage_label:28s}: "
+                    f"median={values_us.median().item():8.2f} us, "
+                    f"critical={values_us.max().item():8.2f} us",
+                    flush=True,
+                )
+            full_us = get_values_us(full_name)
             print(
-                f"    {name:30s}: median={values_us.median().item():8.2f} us, "
-                f"min={values_us.min().item():8.2f} us, "
-                f"max={values_us.max().item():8.2f} us",
+                f"    isolated stage sum           : "
+                f"median={stage_sum.median().item():8.2f} us, "
+                f"critical={stage_sum.max().item():8.2f} us",
                 flush=True,
             )
-        baseline_us = (all_medians[:, names.index("baseline_full")] * 1000.0).max().item()
-        fused_us = (all_medians[:, names.index("fused_full")] * 1000.0).max().item()
+            print(
+                f"    measured full path           : "
+                f"median={full_us.median().item():8.2f} us, "
+                f"critical={full_us.max().item():8.2f} us",
+                flush=True,
+            )
+
+        print("  rank-median latency (critical=max rank):", flush=True)
+        if args.components:
+            print_pipeline(
+                "baseline",
+                (
+                    ("NCCL dispatch", "dispatch"),
+                    ("gather L1", "gather_l1"),
+                    ("SwiGLU + FP8 quant", "swiglu"),
+                    ("L2 + remote scatter + sync", "l2_scatter_and_peer_sync"),
+                    ("local combine", "local_combine"),
+                ),
+                "baseline_full",
+            )
+            print_pipeline(
+                "fused",
+                (
+                    ("NCCL dispatch", "dispatch"),
+                    ("fused gather L1 + SwiGLU", "fused_gather_l1_swiglu"),
+                    ("L2 + remote scatter + sync", "l2_scatter_and_peer_sync"),
+                    ("local combine", "local_combine"),
+                ),
+                "fused_full",
+            )
+            print("  joint-sequence diagnostics:", flush=True)
+            diagnostic_names = (
+                "baseline_gather_l1_swiglu",
+                "baseline_l1_swiglu_l2_scatter",
+                "fused_l1_swiglu_l2_scatter",
+            )
+        else:
+            diagnostic_names = ("baseline_full", "fused_full")
+        for name in diagnostic_names:
+            values_us = get_values_us(name)
+            print(
+                f"    {name:34s}: median={values_us.median().item():8.2f} us, "
+                f"critical={values_us.max().item():8.2f} us",
+                flush=True,
+            )
+        baseline_us = get_values_us("baseline_full").max().item()
+        fused_us = get_values_us("fused_full").max().item()
         print(
             f"  final speedup={baseline_us / fused_us:.3f}x, "
             f"critical_saved={baseline_us - fused_us:.2f} us",

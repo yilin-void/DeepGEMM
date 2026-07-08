@@ -85,10 +85,10 @@ pipeline stages. For the target specialization ptxas reports:
 Used 168 registers, used 10 barriers
 ```
 
-The previous M128/N128 N2-cluster implementation remains available with
-`DG_SM90_SWIGLU_BLOCK_N=128`. It uses six pipeline stages and exchanges 512 bytes
-of row amax through DSM transaction barriers. Keeping it selectable provides a
-direct A/B reference for the macro-tile.
+An earlier M128/N128 N2-cluster experiment used six pipeline stages and exchanged
+512 bytes of row amax through DSM transaction barriers. Its implementation is no
+longer retained in the production source; the measurements remain documented
+below as the direct predecessor of the macro-tile design.
 
 Current restrictions are:
 
@@ -148,7 +148,7 @@ N256 fused one-kernel path  1278.896 us rank median
 speedup                        1.024x
 ```
 
-In the immediately following run, the selectable N128 cluster path measured
+In the immediately following historical run, the N128 cluster path measured
 1475.920 us against a 1312.128 us baseline (`0.889x`). The single-CTA macro-tile
 therefore removes about 197 us from the fused kernel by eliminating DSM exchange
 and duplicate gather-A loads. It turns the previous regression into a modest
@@ -193,34 +193,81 @@ numbers use the maximum across per-rank medians as the critical latency.
 Components are diagnostic and should not be summed: isolated stages have
 different cache state and do not include the same cross-rank arrival skew.
 
+Baseline has five measured stages:
+
 ```text
-stage                                      BF16 critical    FP8 critical
-NCCL dispatch                                  359.87 us       357.38 us
-baseline gather L1 + SwiGLU                   1300.93 us      1305.65 us
-fused gather L1 + SwiGLU                      1311.06 us      1303.89 us
-L2 + remote scatter + peer completion         1511.32 us      1224.26 us
-local combine                                  167.71 us       192.36 us
-baseline L1/SwiGLU + L2/scatter chain         2795.88 us      2530.11 us
-fused L1/SwiGLU + L2/scatter chain            2662.29 us      2459.09 us
-baseline full pipeline                        3287.97 us      3040.22 us
-fused full pipeline                           3136.39 us      2897.83 us
-fusion speedup                                   1.048x          1.049x
-critical time saved                            151.59 us       142.38 us
+stage                                 BF16 median/critical     FP8 median/critical
+1. NCCL dispatch                         355.84 /  357.92 us     355.61 /  358.54 us
+2. gather L1                            1073.41 / 1091.79 us    1073.54 / 1094.59 us
+3. SwiGLU + FP8 quant                    249.54 /  274.31 us     255.66 /  274.45 us
+4. L2 + remote scatter + peer sync      1506.01 / 1506.95 us    1227.02 / 1230.36 us
+5. local combine                         166.27 /  166.61 us     189.62 /  191.98 us
+isolated five-stage sum                 3353.07 / 3395.74 us    3100.49 / 3143.48 us
+measured full path                      3286.32 / 3290.38 us    3045.88 / 3049.12 us
 ```
 
-The full-only repeat measured `3317.35 us -> 3166.89 us` for BF16 (`1.048x`)
-and `3023.08 us -> 2888.33 us` for FP8 (`1.047x`). FP8 makes the L2/scatter
-stage about 287 us faster than BF16 in the component run. Its dequantizing local
-combine is about 25 us slower, but the complete fused path is still about 239 us
-faster. The reduced remote payload is the likely primary contributor.
+The fused path has four measured stages:
 
-For both scatter precisions, the integrated compute chain saves more time than
-the isolated L1/SwiGLU microbenchmark. This shows that removing the large BF16
-intermediate affects the immediately following L2 execution and/or cross-rank
-arrival behavior. Cache residency and memory-system state are plausible
-contributors, but attributing the difference precisely requires a kernel
-timeline and hardware-counter profile; the benchmark only establishes the
-integrated effect.
+```text
+stage                                 BF16 median/critical     FP8 median/critical
+1. NCCL dispatch                         355.84 /  357.92 us     355.61 /  358.54 us
+2. fused gather L1 + SwiGLU             1224.42 / 1261.78 us    1209.08 / 1258.03 us
+3. L2 + remote scatter + peer sync      1506.01 / 1506.95 us    1227.02 / 1230.36 us
+4. local combine                         166.27 /  166.61 us     189.62 /  191.98 us
+isolated four-stage sum                 3250.54 / 3291.42 us    2983.52 / 3029.43 us
+measured full path                      3137.87 / 3140.55 us    2903.71 / 2905.00 us
+```
+
+The authoritative full-path comparisons are therefore:
+
+```text
+scatter dtype       baseline       fused       saved      speedup
+BF16               3290.38 us    3140.55 us   149.83 us    1.048x
+FP8                3049.12 us    2905.00 us   144.12 us    1.050x
+```
+
+A full-only repeat measured `3317.35 us -> 3166.89 us` for BF16 (`1.048x`)
+and `3023.08 us -> 2888.33 us` for FP8 (`1.047x`). FP8 makes the isolated
+L2/scatter stage about 277 us faster than BF16. Its dequantizing local combine
+is about 25 us slower, but the complete fused path is still about 236 us faster.
+The reduced remote payload is the likely primary contributor.
+
+Joint-sequence measurements provide the bridge between isolated stages and the
+full path:
+
+```text
+sequence                                  BF16 critical    FP8 critical
+baseline gather L1 + SwiGLU                  1320.14 us       1330.08 us
+baseline L1/SwiGLU + L2/scatter              2810.35 us       2555.61 us
+fused L1/SwiGLU + L2/scatter                 2667.56 us       2454.54 us
+```
+
+The jointly measured middle-stage delta is about 58 us for BF16 and 72 us for
+FP8, while adding L2/scatter increases the delta to about 143 us and 101 us,
+respectively. This shows that removing the large BF16 intermediate affects the
+immediately following L2 execution and/or cross-rank arrival behavior. Cache
+residency and memory-system state are plausible contributors, but attributing
+the difference precisely requires a kernel timeline and hardware-counter
+profile; the benchmark only establishes the integrated effect. The isolated
+stage sum is intentionally reported but is not the end-to-end latency: each
+isolated measurement introduces its own stream completion, cache state, and
+rank synchronization.
+
+The stage breakdown leads to four practical conclusions:
+
+- Removing the standalone 249-256 us SwiGLU kernel does not translate into the
+  same isolated saving, because the fused L1 stage performs SwiGLU, amax
+  reduction, FP8 quantization, and output stores itself. The jointly measured
+  middle-stage saving is 58-72 us.
+- BF16 L2/scatter is the largest isolated stage at about 1.51 ms, roughly 44%
+  of the baseline isolated-stage sum. With FP8 scatter it drops to about 1.23
+  ms and is comparable to the fused L1/SwiGLU stage.
+- Dispatch remains about 356-359 us and local combine about 167 us for BF16 or
+  190-192 us for FP8. These stages are unchanged by this fusion and limit the
+  layer-level speedup.
+- The final 144-150 us saving is larger than the isolated middle-stage saving,
+  so roughly half of the observed layer benefit comes from better behavior in
+  the following L2/scatter sequence rather than only eliminating one launch.
 
 The final FP32 local-combine output was compared after running both complete
 paths from the same dispatched input, routing, weights, and top-k scores. The
@@ -298,12 +345,6 @@ python3 tests/bench_sm90_gather_l1_swiglu_e2e.py \
 `--no-dispatch-scales` to reproduce the older all-gather benchmark's data-only
 dispatch convention, and `--no-components` to skip diagnostic stage
 measurements while retaining the balanced full-path comparison.
-
-Run the retained N128 cluster comparison by prefixing the same command with:
-
-```bash
-DG_SM90_SWIGLU_BLOCK_N=128
-```
 
 Force a clean JIT compile and inspect ptxas resources by setting a new cache
 directory and `DG_JIT_PTXAS_VERBOSE=1` on the benchmark command.
