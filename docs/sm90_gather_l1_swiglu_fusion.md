@@ -161,6 +161,79 @@ spill, but accumulated excessive rounding error at the target K=2048
 (`7.87e-5` dequantized diff and 5.25% FP8 mismatch). The retained partial-fragment
 implementation restores the same target accuracy as the N128 cluster path.
 
+## Full MoE pipeline benchmark
+
+`tests/bench_sm90_gather_l1_swiglu_e2e.py` extends the comparison to the full
+five-stage logical path:
+
+```text
+baseline: NCCL dispatch -> gather L1 -> SwiGLU -> L2 + remote scatter -> local combine
+fused:    NCCL dispatch -> fused gather L1 + SwiGLU -> L2 + remote scatter -> local combine
+```
+
+The dispatch uses the repository's direct C++ `ncclAllGather` wrapper. By
+default it gathers both the FP8 activation data and its per-token FP32 scales as
+two collectives on the same communication stream. Routing, gather-layout
+construction, weight preprocessing, and tensor allocation remain outside the
+timed region. This isolates execution of an already-routed MoE layer rather than
+gate or setup work.
+
+L2 uses the existing FP8 direct-accumulator scatter epilogue. Every rank writes
+its output rows directly into the owning rank's CUDA-IPC combine buffer, with an
+FP32 scale per 32 output columns. The timed path synchronizes all outbound peer
+stores before launching `combine_reduce_slots_fp8`; this synchronization is
+required for correctness and is included in both paths. Top-k weights are first
+applied by the local combine kernel, not by the L2 epilogue.
+
+For the target 8-H200 workload, the logical M values were
+`[115584, 115200, 115584, 115328, 115328, 115072, 115456, 115328]`. The following
+numbers use the maximum across per-rank medians as the critical latency. The
+component median column is diagnostic and should not be summed: isolated stages
+have different cache state and do not include the same cross-rank arrival skew.
+
+```text
+stage                                      rank median      critical
+NCCL dispatch                                  356.11 us      358.52 us
+baseline gather L1 + SwiGLU                   1277.97 us     1300.28 us
+fused gather L1 + SwiGLU                      1248.18 us     1316.68 us
+L2 + remote scatter + peer completion         1227.77 us     1228.29 us
+local combine                                  191.53 us      195.87 us
+baseline L1/SwiGLU + L2/scatter chain         2523.55 us     2531.23 us
+fused L1/SwiGLU + L2/scatter chain            2444.05 us     2448.29 us
+baseline full pipeline                        3039.96 us     3043.29 us
+fused full pipeline                           2901.58 us     2903.42 us
+```
+
+The full-pipeline result is `1.048x`, saving `139.87 us` on the critical rank.
+A second full-only run measured `3018.77 us -> 2881.06 us`, also `1.048x`; an
+earlier run measured `1.044x`. With the legacy all-gather benchmark convention
+that communicates FP8 data but pre-populates scales, the result was
+`2997.01 us -> 2849.47 us`, or `1.052x`.
+
+The integrated compute chain saves about 83 us even though the isolated
+L1/SwiGLU microbenchmark saves only about 25-30 us in current reruns. This shows
+that removing the large BF16 intermediate affects the immediately following L2
+execution and/or cross-rank arrival behavior. Cache residency and memory-system
+state are plausible contributors, but attributing the difference precisely
+requires a kernel timeline and hardware-counter profile; the benchmark only
+establishes the integrated effect.
+
+The final FP32 local-combine output was compared after running both complete
+paths from the same dispatched input, routing, weights, and top-k scores. The
+eight-rank aggregate metrics were:
+
+```text
+normalized difference       2.502e-08
+mean absolute error         4.071e-04
+maximum absolute error      1.074e+01
+exact mismatch rate         5.240e-03
+reference absolute mean     9.361e+01
+```
+
+The exact mismatch rate includes small L2 FP8 bin-boundary changes propagated
+through local combine. The normalized and mean errors remain small relative to
+the output magnitude.
+
 ## Commands
 
 Build the extension:
@@ -196,6 +269,26 @@ python3 tests/bench_sm90_gather_l1_swiglu.py \
   --iters 20 \
   --check
 ```
+
+Run the full dispatch-through-combine comparison:
+
+```bash
+python3 tests/bench_sm90_gather_l1_swiglu_e2e.py \
+  --num-local-ranks 8 \
+  --tokens-per-rank 6976 \
+  --hidden 2048 \
+  --intermediate 1280 \
+  --top-k 16 \
+  --global-num-experts 512 \
+  --experts-per-rank-token 2 \
+  --warmups 5 \
+  --iters 20 \
+  --check
+```
+
+Use `--no-dispatch-scales` to reproduce the older all-gather benchmark's
+data-only dispatch convention, and `--no-components` to skip diagnostic stage
+measurements while retaining the balanced full-path comparison.
 
 Run the retained N128 cluster comparison by prefixing the same command with:
 
