@@ -826,38 +826,32 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     for (uint32_t pair = 0; pair < kPairsPerThread; ++pair) {
                         const uint32_t gate_base = (pair * 2 + 0) * 4;
                         const uint32_t up_base = (pair * 2 + 1) * 4;
-                        const float gate_0_0 = __bfloat162float(
-                            __float2bfloat16_rn(macro_accum[subtile][gate_base + 0]));
-                        const float gate_0_1 = __bfloat162float(
-                            __float2bfloat16_rn(macro_accum[subtile][gate_base + 1]));
-                        const float gate_1_0 = __bfloat162float(
-                            __float2bfloat16_rn(macro_accum[subtile][gate_base + 2]));
-                        const float gate_1_1 = __bfloat162float(
-                            __float2bfloat16_rn(macro_accum[subtile][gate_base + 3]));
-                        const float up_0_0 = __bfloat162float(
-                            __float2bfloat16_rn(macro_accum[subtile][up_base + 0]));
-                        const float up_0_1 = __bfloat162float(
-                            __float2bfloat16_rn(macro_accum[subtile][up_base + 1]));
-                        const float up_1_0 = __bfloat162float(
-                            __float2bfloat16_rn(macro_accum[subtile][up_base + 2]));
-                        const float up_1_1 = __bfloat162float(
-                            __float2bfloat16_rn(macro_accum[subtile][up_base + 3]));
-                        const float value_0_0 =
-                            __fdividef(gate_0_0, 1.0f + __expf(-gate_0_0)) * up_0_0;
-                        const float value_0_1 =
-                            __fdividef(gate_0_1, 1.0f + __expf(-gate_0_1)) * up_0_1;
-                        const float value_1_0 =
-                            __fdividef(gate_1_0, 1.0f + __expf(-gate_1_0)) * up_1_0;
-                        const float value_1_1 =
-                            __fdividef(gate_1_1, 1.0f + __expf(-gate_1_1)) * up_1_1;
-                        macro_accum[subtile][gate_base + 0] = value_0_0;
-                        macro_accum[subtile][gate_base + 1] = value_0_1;
-                        macro_accum[subtile][gate_base + 2] = value_1_0;
-                        macro_accum[subtile][gate_base + 3] = value_1_1;
+                        const float2 gate_0 = __bfloat1622float2(__float22bfloat162_rn(
+                            make_float2(macro_accum[subtile][gate_base + 0],
+                                        macro_accum[subtile][gate_base + 1])));
+                        const float2 gate_1 = __bfloat1622float2(__float22bfloat162_rn(
+                            make_float2(macro_accum[subtile][gate_base + 2],
+                                        macro_accum[subtile][gate_base + 3])));
+                        const float2 up_0 = __bfloat1622float2(__float22bfloat162_rn(
+                            make_float2(macro_accum[subtile][up_base + 0],
+                                        macro_accum[subtile][up_base + 1])));
+                        const float2 up_1 = __bfloat1622float2(__float22bfloat162_rn(
+                            make_float2(macro_accum[subtile][up_base + 2],
+                                        macro_accum[subtile][up_base + 3])));
+                        const float2 value_0 = make_float2(
+                            __fdividef(gate_0.x, 1.0f + __expf(-gate_0.x)) * up_0.x,
+                            __fdividef(gate_0.y, 1.0f + __expf(-gate_0.y)) * up_0.y);
+                        const float2 value_1 = make_float2(
+                            __fdividef(gate_1.x, 1.0f + __expf(-gate_1.x)) * up_1.x,
+                            __fdividef(gate_1.y, 1.0f + __expf(-gate_1.y)) * up_1.y);
+                        macro_accum[subtile][gate_base + 0] = value_0.x;
+                        macro_accum[subtile][gate_base + 1] = value_0.y;
+                        macro_accum[subtile][gate_base + 2] = value_1.x;
+                        macro_accum[subtile][gate_base + 3] = value_1.y;
                         local_amax_0 = cute::max(
-                            local_amax_0, cute::max(fabsf(value_0_0), fabsf(value_0_1)));
+                            local_amax_0, cute::max(fabsf(value_0.x), fabsf(value_0.y)));
                         local_amax_1 = cute::max(
-                            local_amax_1, cute::max(fabsf(value_1_0), fabsf(value_1_1)));
+                            local_amax_1, cute::max(fabsf(value_1.x), fabsf(value_1.y)));
                     }
                 }
                 local_amax_0 = math::warp_reduce<4, false>(
@@ -878,6 +872,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 }
 
                 auto* smem_swiglu = reinterpret_cast<__nv_fp8_e4m3*>(smem_d);
+                constexpr uint32_t kStoreVecElems = 16;
+                constexpr uint32_t kVecsPerRow = kSwiGLUBlockN / kStoreVecElems;
+                DG_STATIC_ASSERT(kVecsPerRow == 8,
+                                 "SwiGLU store swizzle requires a K128 output tile");
+                const uint32_t smem_store_swizzle = (r_0 & 7u) * kStoreVecElems;
                 #pragma unroll
                 for (uint32_t subtile = 0; subtile < kNumNSubtiles; ++subtile) {
                     #pragma unroll
@@ -892,17 +891,17 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const uint32_t col = subtile * kSwiGLUBlockNPerSubtile +
                             pair * 8 + (lane_idx & 3u) * 2;
                         *reinterpret_cast<uint16_t*>(
-                            smem_swiglu + r_0 * kSwiGLUBlockN + col) =
+                            smem_swiglu + r_0 * kSwiGLUBlockN +
+                            (col ^ smem_store_swizzle)) =
                             *reinterpret_cast<const uint16_t*>(&q0);
                         *reinterpret_cast<uint16_t*>(
-                            smem_swiglu + r_1 * kSwiGLUBlockN + col) =
+                            smem_swiglu + r_1 * kSwiGLUBlockN +
+                            (col ^ smem_store_swizzle)) =
                             *reinterpret_cast<const uint16_t*>(&q1);
                     }
                 }
                 cutlass::arch::NamedBarrier::sync(kNumMathThreads, 1);
 
-                constexpr uint32_t kStoreVecElems = 16;
-                constexpr uint32_t kVecsPerRow = kSwiGLUBlockN / kStoreVecElems;
                 auto* gmem_d_fp8 = reinterpret_cast<__nv_fp8_e4m3*>(gmem_d);
                 for (uint32_t linear = threadIdx.x; linear < BLOCK_M * kVecsPerRow;
                      linear += kNumMathThreads) {
@@ -911,8 +910,9 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     const uint32_t logical_m = base_m_idx + row;
                     if (logical_m >= shape_m)
                         continue;
+                    const uint32_t smem_vec = vec ^ (row & 7u);
                     const auto* src =
-                        smem_swiglu + row * kSwiGLUBlockN + vec * kStoreVecElems;
+                        smem_swiglu + row * kSwiGLUBlockN + smem_vec * kStoreVecElems;
                     const uint4 packed = *reinterpret_cast<const uint4*>(src);
                     const uint32_t output_col =
                         n_block_idx * kSwiGLUBlockN + vec * kStoreVecElems;

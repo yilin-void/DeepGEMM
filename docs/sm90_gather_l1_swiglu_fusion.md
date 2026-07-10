@@ -76,9 +76,10 @@ large prescale/postscale numerical error. Although the source-level arrays total
 kernel spill-free.
 
 SwiGLU values remain in the two final fragments while the CTA reduces amax over
-both 64-channel halves. Math threads then quantize into a 16 KB FP8 shared tile,
-followed by vectorized 16-byte global stores. The wider B tile allows four A/B
-pipeline stages. For the target specialization ptxas reports:
+both 64-channel halves. Math threads then quantize into a 16 KB FP8 shared tile.
+The tile uses an eight-row XOR swizzle, after which all CTA threads perform
+coalesced 16-byte shared loads and global stores. The wider B tile allows four
+A/B pipeline stages. For the target specialization ptxas reports:
 
 ```text
 0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
@@ -160,6 +161,60 @@ prescale/WGMMA/postscale variant used only two fragments and had just 8 bytes of
 spill, but accumulated excessive rounding error at the target K=2048
 (`7.87e-5` dequantized diff and 5.25% FP8 mismatch). The retained partial-fragment
 implementation restores the same target accuracy as the N128 cluster path.
+
+## Single-H200 epilogue optimization
+
+The SwiGLU epilogue was profiled separately on one H200 with the same per-GPU
+amount of L1 work as the eight-GPU target. The shape was `M=115456`, `H=2048`,
+`I=1280`, and 64 local experts. Each timing combines two passes in opposite
+order, with 10 warmups and 50 iterations per pass.
+
+```text
+variant                                      fused median       vs. original
+scalar BF16 round-trip, row-major shared      1297.616 us          1.000x
+packed BF16 round-trip, row-major shared      1272.992 us          1.019x
+scalar BF16 round-trip, XOR shared            1279.216 us          1.014x
+packed BF16 round-trip, XOR shared            1231.968 us          1.053x
+```
+
+The packed version rounds two FP32 accumulator values to BF16 with
+`__float22bfloat162_rn(make_float2(...))`, then converts the packed result back
+to two FP32 registers for the existing scalar `exp`, reciprocal, multiply, and
+amax sequence. This preserves the standalone BF16 L1 boundary exactly. Static
+SASS changes the 128 scalar BF16 conversions into 64
+`F2FP.BF16.F32.PACK_AB` instructions; the 64 `MUFU.EX2` and 72 `MUFU.RCP`
+instructions are unchanged. CUDA has no corresponding packed FP32 exponential,
+so `float2` only helps the BF16 conversion here.
+
+The quantized fragment layout is not contiguous in global-memory order. The
+kernel therefore keeps the existing shared-memory staging step: math threads
+write packed FP8 pairs, synchronize, and all 384 CTA threads cooperatively issue
+`LDS.128` plus `STG.E.128`. The new physical shared vector index is
+`logical_vector XOR (row & 7)`; the global vector index remains logical. NCU
+reported the following counters for one profiled launch:
+
+```text
+metric                                  original       packed + XOR
+kernel duration                          1.44 ms             1.28 ms
+shared-store bank conflicts           16,163,840               927
+shared-load instructions               2,633,840         2,633,840
+shared-store instructions              2,309,516         2,309,516
+global-store instructions                432,960           432,960
+TMA-store instructions                          0                 0
+```
+
+NCU replay duration is diagnostic rather than the benchmark latency. Its main
+result is that the XOR layout removes essentially all shared-store bank
+conflicts without changing global traffic. The final cubin uses 168 registers,
+zero stack bytes, and zero local-memory bytes, so neither optimization adds a
+spill.
+
+A one-buffer TMA-store variant was also tested. It reduced executed global-store
+instructions from 432,960 to 144,320 and shared-load instructions from 2,633,840
+to 2,345,200, but required a completion wait before the shared buffer could be
+reused. Interleaved comparisons ranged from a 0.8% regression to a 1.9% gain and
+did not reproduce consistently. The retained implementation therefore uses the
+cooperative 128-bit store path rather than TMA.
 
 ## Full MoE pipeline benchmark
 
