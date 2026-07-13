@@ -16,6 +16,8 @@ fused:    dispatch -> fused gather L1 + SwiGLU -> L2 + scatter -> local combine
 - 实际 MMA 保留两组原生 `m64n128k32`，避免原生 N256 WGMMA 带来的寄存器溢出。
 - gate/up FP8 weight 按 8 通道交错，K128 weight scale 保持原布局。
 - 保留 baseline 的 BF16 L1 边界，再做 SwiGLU、per-K128 amax 和 E4M3 quant。
+- BF16 round-trip 使用 packed `bfloat162` 转换；FP8 shared tile 使用按行 XOR
+  swizzle，将 shared-store bank conflict 从约 1616 万降至 927。
 - 4-stage pipeline，16 KB FP8 shared staging；ptxas 为 168 registers、0 spill。
 - L2 scatter 支持 BF16（N32 permutation）和 FP8（N64 permutation + per-32 FP32 scale）。
 
@@ -26,7 +28,7 @@ fused:    dispatch -> fused gather L1 + SwiGLU -> L2 + scatter -> local combine
 | M128/N128、2 CTA cluster + DSM amax | `1475.920 us` vs baseline `1312.128 us`，`0.889x` | DSM、重复 gather A 开销过高 |
 | M64/N128、264 persistent CTA | 约 `1788 us`，0 spill | tile 过小，调度/访存开销上升 |
 | N256 prescale/WGMMA/postscale | 8-byte spill；dequant diff `7.87e-5`；FP8 mismatch `5.25%` | 精度不可接受 |
-| 最终 M128/N256 macro-tile | `1278.896 us` vs baseline `1309.712 us`，`1.024x` | 保留；精度与资源均满足要求 |
+| 最终 M128/N256 macro-tile + epilogue 优化 | `1175.584 us` vs baseline `1336.464 us`，`1.137x` | 保留；精度与资源均满足要求 |
 
 ## 测试口径
 
@@ -43,10 +45,10 @@ payload/rank         14.733 MB，NCCL CTAs=64
 timing               5 warmups，20 iterations；正反顺序各一轮
 ```
 
-每个 rank 先对迭代取 median；下表统一报告这些 rank median 的最大值
-（`critical`），因为 collective 和跨 rank 同步的完整路径由最慢 rank 决定。
-独立阶段各自包含 stream completion/同步，其求和仅用于拆解，不能替代真实
-整链计时。
+每个 rank 先对迭代取 median。Isolated L1 表沿用 benchmark 输出，报告各
+rank median 的中位数；Full MoE 表报告各 rank median 的最大值（`critical`），
+因为 collective 和跨 rank 同步的完整路径由最慢 rank 决定。独立阶段各自
+包含 stream completion/同步，其求和仅用于拆解，不能替代真实整链计时。
 
 ## 测试结果
 
@@ -54,7 +56,10 @@ timing               5 warmups，20 iterations；正反顺序各一轮
 
 | 测试 | Gather L1 | SwiGLU | Baseline 2 kernels | Fused 1 kernel | 加速比 |
 |---|---:|---:|---:|---:|---:|
-| 最终测试 | `1052.528 us` | `203.008 us` | `1309.712 us` | `1278.896 us` | `1.024x` |
+| 最终测试 | `1048.832 us` | `202.832 us` | `1336.464 us` | `1175.584 us` | `1.137x` |
+
+三次独立执行的 fused rank median 为 `1173.040 / 1173.136 / 1175.584 us`；
+上表保留最后一轮完整数据。
 
 中间 FP8 输出正确性（8-rank max）：
 
@@ -70,39 +75,39 @@ dequantized max abs    9.699e+00
 
 | 阶段 | BF16 critical | FP8 critical |
 |---|---:|---:|
-| 1. NCCL dispatch | `357.92 us` | `358.54 us` |
-| 2. Gather L1 | `1091.79 us` | `1094.59 us` |
-| 3. SwiGLU + FP8 quant | `274.31 us` | `274.45 us` |
-| 4. L2 + remote scatter + peer sync | `1506.95 us` | `1230.36 us` |
-| 5. Local combine | `166.61 us` | `191.98 us` |
-| 独立阶段之和 | `3395.74 us` | `3143.48 us` |
-| **真实完整路径** | **`3290.38 us`** | **`3049.12 us`** |
+| 1. NCCL dispatch | `384.20 us` | `381.00 us` |
+| 2. Gather L1 | `1105.77 us` | `1125.06 us` |
+| 3. SwiGLU + FP8 quant | `305.11 us` | `312.72 us` |
+| 4. L2 + remote scatter + peer sync | `1557.08 us` | `1288.86 us` |
+| 5. Local combine | `181.70 us` | `206.45 us` |
+| 独立阶段之和 | `3523.94 us` | `3304.40 us` |
+| **真实完整路径** | **`3299.26 us`** | **`3060.68 us`** |
 
 ### 3. Full MoE：Fused 4 阶段
 
 | 阶段 | BF16 critical | FP8 critical |
 |---|---:|---:|
-| 1. NCCL dispatch | `357.92 us` | `358.54 us` |
-| 2. Fused gather L1 + SwiGLU | `1261.78 us` | `1258.03 us` |
-| 3. L2 + remote scatter + peer sync | `1506.95 us` | `1230.36 us` |
-| 4. Local combine | `166.61 us` | `191.98 us` |
-| 独立阶段之和 | `3291.42 us` | `3029.43 us` |
-| **真实完整路径** | **`3140.55 us`** | **`2905.00 us`** |
+| 1. NCCL dispatch | `384.20 us` | `381.00 us` |
+| 2. Fused gather L1 + SwiGLU | `1204.86 us` | `1197.79 us` |
+| 3. L2 + remote scatter + peer sync | `1557.08 us` | `1288.86 us` |
+| 4. Local combine | `181.70 us` | `206.45 us` |
+| 独立阶段之和 | `3303.92 us` | `3056.22 us` |
+| **真实完整路径** | **`3085.75 us`** | **`2850.03 us`** |
 
 完整路径结论：
 
 | Scatter | Baseline | Fused | 节省 | 加速比 |
 |---|---:|---:|---:|---:|
-| BF16 | `3290.38 us` | `3140.55 us` | `149.83 us` | `1.048x` |
-| FP8 | `3049.12 us` | `2905.00 us` | `144.12 us` | `1.050x` |
+| BF16 | `3299.26 us` | `3085.75 us` | `213.51 us` | `1.069x` |
+| FP8 | `3060.68 us` | `2850.03 us` | `210.64 us` | `1.074x` |
 
 联合序列（critical）：
 
 | 序列 | BF16 | FP8 |
 |---|---:|---:|
-| Baseline gather L1 + SwiGLU | `1320.14 us` | `1330.08 us` |
-| Baseline L1/SwiGLU + L2/scatter | `2810.35 us` | `2555.61 us` |
-| Fused L1/SwiGLU + L2/scatter | `2667.56 us` | `2454.54 us` |
+| Baseline gather L1 + SwiGLU | `1371.58 us` | `1368.12 us` |
+| Baseline L1/SwiGLU + L2/scatter | `2835.31 us` | `2581.28 us` |
+| Fused L1/SwiGLU + L2/scatter | `2626.72 us` | `2393.12 us` |
 
 ### 4. 完整输出正确性
 
@@ -128,16 +133,18 @@ ptxas                      168 registers，10 barriers，0 stack/0 spill
 
 ## 结论
 
-- 融合有效但收益有限：isolated 提升 `1.024x`；完整层在 BF16/FP8 scatter
-  下分别提升 `1.048x` 和 `1.050x`。
-- 独立 SwiGLU 为 `249-256 us`，但融合 kernel 自身仍承担激活、amax、quant
-  和 store，联合中间阶段仅净省 `58-72 us`。
-- 加入 L2/scatter 后净省扩大到 BF16 `143 us`、FP8 `101 us`，说明移除 BF16
-  中间张量还改善了后续缓存/内存状态或跨 rank 到达行为。
-- BF16 最大瓶颈是 L2/scatter（约 `1.51 ms`）；FP8 将其降至约 `1.23 ms`，
-  虽然 local combine 慢约 `25 us`，完整 fused 路径仍比 BF16 快约 `236 us`。
-- dispatch（约 `356-359 us`）和 combine（约 `167/192 us`）未被本次融合覆盖，
-  是继续提升 layer-level speedup 的固定开销。
+- packed BF16 转换和 shared XOR swizzle 将 isolated 融合收益从原来的
+  `1.024x` 提高到 `1.137x`；fused kernel 三次执行稳定在 `1173-1176 us`。
+- 完整层在 BF16/FP8 scatter 下分别提升 `1.069x` 和 `1.074x`，关键路径净省
+  `213.51 us` 和 `210.64 us`。full-only 复测仍分别节省 `207.94 us` 和
+  `198.23 us`。
+- 独立 SwiGLU median 为 `253-258 us`，融合 kernel 自身仍承担激活、amax、
+  quant 和 store；联合中间阶段实际净省 `167-170 us`。
+- 加入 L2/scatter 后联合序列净省扩大到 BF16 `209 us`、FP8 `188 us`，说明
+  移除 BF16 中间张量还影响了后续缓存/内存状态或跨 rank 到达行为。
+- BF16 最大瓶颈是 L2/scatter（约 `1.56 ms`）；FP8 将其降至约 `1.29 ms`。
+  dispatch（约 `381-384 us` critical）和 combine（约 `182/206 us`）仍是
+  本次融合没有覆盖的固定开销。
 
 ## 复现命令
 
